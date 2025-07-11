@@ -1,0 +1,23 @@
+{
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": true
+  },
+  "typescript.preferences.importModuleSpecifier": "relative",
+  "files.exclude": {
+    "node_modules": true,
+    "dist": true,
+    "*.log": true
+  },
+  "search.exclude": {
+    "node_modules": true,
+    "dist": true,
+    "*.log": true
+  },
+  "typescript.suggest.autoImports": true,
+  "editor.rulers": [100],
+  "editor.tabSize": 2,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true
+}
