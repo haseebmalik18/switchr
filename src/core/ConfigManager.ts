@@ -276,7 +276,7 @@ export class ConfigManager {
       ...(profile.services.length > 0 && {
         services: profile.services.map(service => ({
           name: service.name,
-          command: service.command,
+          ...(service.command && { command: service.command }),
           ...(service.port && { port: service.port }),
           ...(service.healthCheck && { healthCheck: service.healthCheck }),
           ...(service.dependencies &&
