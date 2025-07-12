@@ -6,12 +6,22 @@
   "bin": {
     "switchr": "./bin/run"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/haseebmalik18/switchr.git"
+  },
+  "bugs": {
+    "url": "https://github.com/haseebmalik18/switchr/issues"
+  },
+  "homepage": "https://github.com/haseebmalik18/switchr#readme",
   "scripts": {
     "build": "tsc",
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
     "test": "jest",
     "test:watch": "jest --watch",
+    "type-check": "tsc --noEmit",
+    "type-check:watch": "tsc --noEmit --watch",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "format": "prettier --write src/**/*.ts",
@@ -27,9 +37,12 @@
     "context",
     "project",
     "cli",
-    "developer-tools"
+    "developer-tools",
+    "devops",
+    "productivity",
+    "workspace"
   ],
-  "author": "Your Name",
+  "author": "Haseeb Malik <haseebmalik18@example.com>",
   "license": "MIT",
   "files": [
     "/bin",

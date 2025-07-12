@@ -1,27 +1,21 @@
 export type ProjectType = 'node' | 'python' | 'java' | 'go' | 'rust' | 'generic';
 
 export interface ToolVersions {
-  node?: string;
-  npm?: string;
-  python?: string;
-  pip?: string;
-  java?: string;
-  maven?: string;
-  gradle?: string;
-  go?: string;
-  rust?: string;
-  [key: string]: string | undefined;
+  [key: string]: string;
 }
 
-export interface Service {
+export interface ServiceDefinition {
   name: string;
   command: string;
   port?: number;
   healthCheck?: string;
   dependencies?: string[];
+  autoRestart?: boolean;
+}
+
+export interface Service extends ServiceDefinition {
   environment?: Record<string, string>;
   workingDirectory?: string;
-  autoRestart?: boolean;
 }
 
 export interface IDEConfig {

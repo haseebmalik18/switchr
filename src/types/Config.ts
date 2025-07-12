@@ -1,6 +1,8 @@
+import { ProjectType, ServiceDefinition } from './Project';
+
 export interface SwitchrConfig {
   version: string;
-  currentProject?: string;
+  currentProject?: string | undefined;
   projectsDir: string;
   configDir: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
@@ -15,17 +17,10 @@ export interface SwitchrConfig {
 
 export interface ProjectConfigFile {
   name: string;
-  type: string;
+  type: ProjectType;
   description?: string;
   environment?: Record<string, string>;
-  services?: Array<{
-    name: string;
-    command: string;
-    port?: number;
-    healthCheck?: string;
-    dependencies?: string[];
-    autoRestart?: boolean;
-  }>;
+  services?: ServiceDefinition[];
   tools?: Record<string, string>;
   ide?: {
     type: string;
