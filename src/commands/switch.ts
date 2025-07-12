@@ -5,6 +5,7 @@ import { ConfigManager } from '../core/ConfigManager';
 import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
 import { ProjectProfile, Service } from '../types/Project';
+import { ServiceDependencyResolver } from '../core/ServiceDependencyResolver';
 
 interface RunningService {
   name: string;
@@ -57,6 +58,7 @@ export default class Switch extends Command {
     this.configManager = ConfigManager.getInstance();
 
     try {
+      // Validate target project exists
       const targetProject = await this.configManager.getProject(args.project);
       if (!targetProject) {
         this.error(
@@ -64,6 +66,7 @@ export default class Switch extends Command {
         );
       }
 
+      // Check if already on target project
       const currentProject = await this.configManager.getCurrentProject();
       if (currentProject?.name === args.project) {
         this.log(chalk.yellow(`📋 Already on project '${args.project}'`));
@@ -78,6 +81,7 @@ export default class Switch extends Command {
         return;
       }
 
+      // Execute the switch
       await this.executeSwitch(currentProject, targetProject, flags);
 
       this.log(chalk.green(`\n✅ Successfully switched to '${args.project}'!`));
@@ -141,14 +145,15 @@ export default class Switch extends Command {
     targetProject: ProjectProfile,
     flags: any
   ): Promise<void> {
+    // Step 1: Stop current services
     if (currentProject && !flags['no-stop']) {
       await this.stopCurrentServices(currentProject, flags.force);
     }
 
-    await this.setEnvironmentVariables(targetProject);
-
+    // Step 2: Update current project in config (no global env setting)
     await this.configManager.setCurrentProject(targetProject.name);
 
+    // Step 3: Start new services with their environment
     if (!flags['no-start']) {
       await this.startProjectServices(targetProject);
     }
@@ -223,11 +228,15 @@ export default class Switch extends Command {
 
   private async stopService(service: RunningService): Promise<void> {
     try {
+      // Try graceful shutdown first
       await ProcessUtils.killProcess(service.pid, 'SIGTERM');
 
+      // Wait a bit for graceful shutdown
       await this.sleep(2000);
 
+      // Check if still running
       if (ProcessUtils.isProcessRunning(service.pid)) {
+        // Force kill if still running
         await ProcessUtils.killProcess(service.pid, 'SIGKILL');
         await this.sleep(1000);
       }
@@ -281,32 +290,94 @@ export default class Switch extends Command {
     const spinner = ora(`🚀 Starting ${project.services.length} service(s)...`).start();
 
     try {
+      // Check for port conflicts
       await this.checkPortConflicts(project.services);
 
-      const startResults = await this.startServicesWithDependencies(project.services, project.path);
+      // Create dependency resolver and startup plan
+      const resolver = new ServiceDependencyResolver(project.services);
+      const startupPlan = resolver.createStartupPlan();
 
-      const successful = startResults.filter(r => r.success).length;
-      const failed = startResults.filter(r => !r.success);
+      spinner.text = `🚀 Starting ${project.services.length} service(s) in ${startupPlan.maxPhases} phases...`;
+
+      // Show dependency tree in verbose mode or if there are dependencies
+      const hasDependencies = project.services.some(
+        s => s.dependencies && s.dependencies.length > 0
+      );
+      if (hasDependencies) {
+        spinner.stop();
+        this.log(chalk.blue('📊 Dependency-aware startup:'));
+        startupPlan.phases.forEach((phase, index) => {
+          const phaseNames = phase.map(s => s.name).join(', ');
+          this.log(chalk.gray(`   Phase ${index + 1}: ${phaseNames}`));
+        });
+        this.log('');
+        spinner.start();
+      }
+
+      // Start services phase by phase
+      const allResults: Array<{
+        service: string;
+        success: boolean;
+        error?: string;
+        phase: number;
+      }> = [];
+
+      for (let phaseIndex = 0; phaseIndex < startupPlan.phases.length; phaseIndex++) {
+        const phase = startupPlan.phases[phaseIndex];
+        spinner.text = `🚀 Starting Phase ${phaseIndex + 1}/${startupPlan.maxPhases}: ${phase.map(s => s.name).join(', ')}...`;
+
+        // Start all services in current phase in parallel
+        const phaseResults = await Promise.all(
+          phase.map(async service => {
+            try {
+              await this.startService(service, project.path, project.environment);
+              return { service: service.name, success: true, phase: phaseIndex + 1 };
+            } catch (error) {
+              return {
+                service: service.name,
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+                phase: phaseIndex + 1,
+              };
+            }
+          })
+        );
+
+        allResults.push(...phaseResults);
+
+        // Wait between phases for services to fully start
+        if (phaseIndex < startupPlan.phases.length - 1) {
+          await this.sleep(2000);
+        }
+      }
+
+      const successful = allResults.filter(r => r.success).length;
+      const failed = allResults.filter(r => !r.success);
 
       if (failed.length === 0) {
-        spinner.succeed(`🚀 Started ${successful} service(s)`);
+        spinner.succeed(
+          `🚀 Started ${successful} service(s) across ${startupPlan.maxPhases} phases`
+        );
       } else {
-        spinner.warn(`🚀 Started ${successful}/${project.services.length} service(s)`);
+        spinner.warn(
+          `🚀 Started ${successful}/${project.services.length} service(s) (${failed.length} failed)`
+        );
         failed.forEach(f => {
-          this.log(chalk.yellow(`   ⚠ ${f.service}: ${f.error}`));
+          this.log(chalk.yellow(`   ⚠ Phase ${f.phase} - ${f.service}: ${f.error}`));
         });
       }
 
-      project.services.forEach(service => {
-        const result = startResults.find(r => r.service === service.name);
-        if (result?.success) {
-          this.log(
-            chalk.gray(
-              `   • ${service.name}${service.port ? ` → http://localhost:${service.port}` : ''}`
-            )
-          );
-        }
-      });
+      // Show running services
+      const successfulResults = allResults.filter(r => r.success);
+      if (successfulResults.length > 0) {
+        this.log('');
+        successfulResults.forEach(result => {
+          const service = project.services.find(s => s.name === result.service);
+          const phaseInfo = chalk.gray(`[Phase ${result.phase}]`);
+          const portInfo = service?.port ? chalk.blue(` → http://localhost:${service.port}`) : '';
+          this.log(chalk.gray(`   • ${result.service} ${phaseInfo}${portInfo}`));
+        });
+      }
     } catch (error) {
       spinner.fail('🚀 Failed to start services');
       throw error;
@@ -332,44 +403,32 @@ export default class Switch extends Command {
     }
   }
 
-  private async startServicesWithDependencies(
-    services: Service[],
-    workingDir: string
-  ): Promise<Array<{ service: string; success: boolean; error?: string }>> {
-    const results: Array<{ service: string; success: boolean; error?: string }> = [];
-
-    // Simple sequential start for now (TODO: implement proper dependency resolution)
-    for (const service of services) {
-      try {
-        await this.startService(service, workingDir);
-        results.push({ service: service.name, success: true });
-
-        await this.sleep(1000);
-      } catch (error) {
-        results.push({
-          service: service.name,
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-      }
-    }
-
-    return results;
-  }
-
-  private async startService(service: Service, workingDir: string): Promise<void> {
+  private async startService(
+    service: Service,
+    workingDir: string,
+    projectEnvironment: Record<string, string> = {}
+  ): Promise<void> {
     const { command, args } = ProcessUtils.parseCommand(service.command);
+
+    // Combine project environment + service-specific environment
+    const serviceEnv = {
+      ...ProcessUtils.getEnvironmentVariables(), // Base system environment
+      ...projectEnvironment, // Project-wide environment
+      ...service.environment, // Service-specific environment (highest priority)
+    };
 
     const child = ProcessUtils.spawn(command, args, {
       cwd: service.workingDirectory || workingDir,
-      env: { ...ProcessUtils.getEnvironmentVariables(), ...service.environment },
+      env: serviceEnv,
       detached: true,
       stdio: 'ignore',
     });
 
+    // Detach the child process so it continues running
     child.unref();
 
     logger.debug(`Started service ${service.name} with command: ${service.command}`);
+    logger.debug(`Environment variables: ${Object.keys(serviceEnv).join(', ')}`);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -381,8 +440,6 @@ export default class Switch extends Command {
     this.log(chalk.gray(`   • Check status: ${chalk.white('switchr status')}`));
     this.log(chalk.gray(`   • View services: ${chalk.white('switchr status --verbose')}`));
     this.log(chalk.gray(`   • Open project: ${chalk.white('code .')}`));
-
-    // TODO: Show service URLs when we have port detection
     this.log(chalk.gray(`   • Stop services: ${chalk.white('switchr stop')}`));
   }
 }

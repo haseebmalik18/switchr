@@ -2,6 +2,7 @@ import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../core/ConfigManager';
+import { ServiceDependencyResolver } from '../core/ServiceDependencyResolver';
 import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
 import { Service } from '../types/Project';
@@ -61,6 +62,7 @@ export default class Start extends Command {
         return;
       }
 
+      // Determine which services to start
       let servicesToStart: Service[] = [];
 
       if (args.service) {
@@ -86,12 +88,19 @@ export default class Start extends Command {
         return;
       }
 
+      // Check for conflicts unless forced
       if (!flags.force) {
         await this.checkPortConflicts(servicesToStart);
       }
 
-      const results = await this.startServices(servicesToStart, currentProject.path);
+      // Start the services
+      const results = await this.startServices(
+        servicesToStart,
+        currentProject.path,
+        currentProject.environment
+      );
 
+      // Show results
       this.showResults(results, servicesToStart);
     } catch (error) {
       logger.error('Failed to start services', error);
@@ -163,34 +172,64 @@ export default class Start extends Command {
 
   private async startServices(
     services: Service[],
-    projectPath: string
+    projectPath: string,
+    projectEnvironment: Record<string, string> = {}
   ): Promise<Array<{ service: string; success: boolean; error?: string; pid?: number }>> {
     const results: Array<{ service: string; success: boolean; error?: string; pid?: number }> = [];
     const spinner = ora('🚀 Starting services...').start();
 
     try {
-      // TODO: Implement proper dependency resolution
-      for (let i = 0; i < services.length; i++) {
-        const service = services[i];
-        spinner.text = `🚀 Starting ${service.name} (${i + 1}/${services.length})...`;
+      // Create dependency resolver and startup plan
+      const resolver = new ServiceDependencyResolver(services);
+      const startupPlan = resolver.createStartupPlan();
 
-        try {
-          const pid = await this.startService(service, projectPath);
-          results.push({
-            service: service.name,
-            success: true,
-            pid,
-          });
+      spinner.text = `🚀 Starting ${services.length} service(s) in ${startupPlan.maxPhases} phases...`;
 
-          if (i < services.length - 1) {
-            await this.sleep(1500);
-          }
-        } catch (error) {
-          results.push({
-            service: service.name,
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error',
-          });
+      // Show dependency tree if there are dependencies
+      const hasDependencies = services.some(s => s.dependencies && s.dependencies.length > 0);
+      if (hasDependencies) {
+        spinner.stop();
+        this.log(chalk.blue('📊 Dependency-aware startup:'));
+        startupPlan.phases.forEach((phase, index) => {
+          const phaseNames = phase.map(s => s.name).join(', ');
+          this.log(chalk.gray(`   Phase ${index + 1}: ${phaseNames}`));
+        });
+        this.log('');
+        spinner.start();
+      }
+
+      // Start services phase by phase
+      for (let phaseIndex = 0; phaseIndex < startupPlan.phases.length; phaseIndex++) {
+        const phase = startupPlan.phases[phaseIndex];
+        spinner.text = `🚀 Starting Phase ${phaseIndex + 1}/${startupPlan.maxPhases}: ${phase.map(s => s.name).join(', ')}...`;
+
+        // Start all services in current phase in parallel
+        const phaseResults = await Promise.all(
+          phase.map(async service => {
+            try {
+              const pid = await this.startService(service, projectPath, projectEnvironment);
+              return {
+                service: service.name,
+                success: true,
+                pid,
+                phase: phaseIndex + 1,
+              };
+            } catch (error) {
+              return {
+                service: service.name,
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+                phase: phaseIndex + 1,
+              };
+            }
+          })
+        );
+
+        results.push(...phaseResults);
+
+        // Wait between phases for services to fully start
+        if (phaseIndex < startupPlan.phases.length - 1) {
+          await this.sleep(1500);
         }
       }
 
@@ -198,7 +237,9 @@ export default class Start extends Command {
       const failed = results.filter(r => !r.success).length;
 
       if (failed === 0) {
-        spinner.succeed(`🚀 Successfully started ${successful} service(s)`);
+        spinner.succeed(
+          `🚀 Successfully started ${successful} service(s) across ${startupPlan.maxPhases} phases`
+        );
       } else if (successful > 0) {
         spinner.warn(`🚀 Started ${successful}/${services.length} service(s) (${failed} failed)`);
       } else {
@@ -212,17 +253,24 @@ export default class Start extends Command {
     return results;
   }
 
-  private async startService(service: Service, projectPath: string): Promise<number> {
+  private async startService(
+    service: Service,
+    projectPath: string,
+    projectEnvironment: Record<string, string> = {}
+  ): Promise<number> {
     const { command, args } = ProcessUtils.parseCommand(service.command);
 
-    const env = {
-      ...ProcessUtils.getEnvironmentVariables(),
-      ...service.environment,
+    // Combine project environment + service-specific environment
+    const serviceEnv = {
+      ...ProcessUtils.getEnvironmentVariables(), // Base system environment
+      ...projectEnvironment, // Project-wide environment
+      ...service.environment, // Service-specific environment (highest priority)
     };
 
+    // Start the process
     const child = ProcessUtils.spawn(command, args, {
       cwd: service.workingDirectory || projectPath,
-      env,
+      env: serviceEnv,
       detached: true,
       stdio: 'ignore',
     });
@@ -231,8 +279,10 @@ export default class Start extends Command {
       throw new Error(`Failed to start process for ${service.name}`);
     }
 
+    // Detach so it continues running
     child.unref();
 
+    // Wait a moment and verify it's still running
     await this.sleep(500);
 
     if (!ProcessUtils.isProcessRunning(child.pid)) {
@@ -252,18 +302,23 @@ export default class Start extends Command {
     const successful = results.filter(r => r.success);
     const failed = results.filter(r => !r.success);
 
+    // Show successful starts
     if (successful.length > 0) {
       this.log(chalk.green('✅ Started services:'));
       successful.forEach(result => {
         const service = services.find(s => s.name === result.service);
         const pidInfo = result.pid ? chalk.gray(` (PID: ${result.pid})`) : '';
+        const phaseInfo = (result as any).phase
+          ? chalk.gray(` [Phase ${(result as any).phase}]`)
+          : '';
         const portInfo = service?.port ? chalk.blue(` → http://localhost:${service.port}`) : '';
 
-        this.log(chalk.gray(`   • ${result.service}${pidInfo}${portInfo}`));
+        this.log(chalk.gray(`   • ${result.service}${phaseInfo}${pidInfo}${portInfo}`));
       });
       this.log('');
     }
 
+    // Show failures
     if (failed.length > 0) {
       this.log(chalk.red('❌ Failed to start:'));
       failed.forEach(result => {
@@ -272,6 +327,7 @@ export default class Start extends Command {
       this.log('');
     }
 
+    // Show next steps
     if (successful.length > 0) {
       this.log(chalk.blue('🎯 Next steps:'));
       this.log(chalk.gray(`   • Check status: ${chalk.white('switchr status')}`));

@@ -25,7 +25,7 @@ export class ProcessUtils {
     return new Promise((resolve, reject) => {
       const child = crossSpawn(command, args, {
         cwd: options.cwd || process.cwd(),
-        env: { ...process.env, ...options.env },
+        env: options.env || process.env, // Use provided env or inherit
         shell: options.shell || false,
         stdio: options.stdio || 'pipe',
       });
@@ -62,7 +62,7 @@ export class ProcessUtils {
   static spawn(command: string, args: string[] = [], options: ProcessOptions = {}): ChildProcess {
     return crossSpawn(command, args, {
       cwd: options.cwd || process.cwd(),
-      env: { ...process.env, ...options.env },
+      env: options.env || process.env, // Use provided env or inherit
       shell: options.shell || false,
       stdio: options.stdio || 'inherit',
       detached: options.detached || false,
