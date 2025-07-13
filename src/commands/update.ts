@@ -37,6 +37,7 @@ export default class Update extends Command {
     '<%= config.bin %> <%= command.id %> --latest',
     '<%= config.bin %> <%= command.id %> --interactive',
     '<%= config.bin %> <%= command.id %> --dry-run',
+    '<%= config.bin %> <%= command.id %> --force',
   ];
 
   static override args = {
@@ -119,10 +120,14 @@ export default class Update extends Command {
   }
 
   private async initializeRegistries(): Promise<void> {
+    const spinner = ora('Initializing package registries...').start();
+
     try {
       await Promise.all([RuntimeRegistry.initialize(), ServiceTemplateRegistry.initialize()]);
+      spinner.succeed('Package registries initialized');
     } catch (error) {
-      logger.warn('Failed to initialize some registries', error);
+      spinner.fail('Failed to initialize registries');
+      throw error;
     }
   }
 
@@ -503,9 +508,11 @@ export default class Update extends Command {
   ): Promise<PackageInstallResult> {
     const packageSpec = `${update.name}@${update.latestVersion}`;
 
-    return await packageManager.addPackage(packageSpec, {
+    const addOptions: any = {
       skipIfExists: false, // Force reinstall to update
-    });
+    };
+
+    return await packageManager.addPackage(packageSpec, addOptions);
   }
 
   private showUpdateResults(results: PackageInstallResult[]): void {
@@ -589,19 +596,52 @@ export default class Update extends Command {
     packageName: string,
     runtime?: string
   ): Promise<string | null> {
-    // This would integrate with package registries (npm, PyPI, etc.)
-    // For now, return a mock implementation
     try {
       switch (runtime) {
         case 'nodejs':
-          // Would use npm registry API
-          return 'latest';
+          return await this.getLatestNpmVersion(packageName);
         case 'python':
-          // Would use PyPI API
-          return 'latest';
+          return await this.getLatestPyPIVersion(packageName);
+        case 'go':
+          return await this.getLatestGoVersion(packageName);
         default:
-          return 'latest';
+          return null;
       }
+    } catch {
+      return null;
+    }
+  }
+
+  private async getLatestNpmVersion(packageName: string): Promise<string | null> {
+    try {
+      const response = await fetch(`https://registry.npmjs.org/${packageName}/latest`);
+      if (!response.ok) return null;
+
+      const data = await response.json();
+      return data.version || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async getLatestPyPIVersion(packageName: string): Promise<string | null> {
+    try {
+      const response = await fetch(`https://pypi.org/pypi/${packageName}/json`);
+      if (!response.ok) return null;
+
+      const data = await response.json();
+      return data.info?.version || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async getLatestGoVersion(packageName: string): Promise<string | null> {
+    try {
+      // Go modules use semantic versioning tags
+      // This would require integration with Go proxy or VCS
+      // For now, return null indicating no update available
+      return null;
     } catch {
       return null;
     }

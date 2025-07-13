@@ -1,9 +1,9 @@
-// src/commands/add.ts - Final complete file with all TypeScript fixes
+// src/commands/add.ts - Fixed version with exactOptionalPropertyTypes support
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../core/ConfigManager';
-import { PackageManager } from '../core/PackageManager';
+import { PackageManager, type AddPackageOptions } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 import { logger } from '../utils/Logger';
@@ -115,15 +115,24 @@ export default class Add extends Command {
         force: flags.force,
       });
 
-      // Add the package
-      const result = await packageManager.addPackage(args.package, {
+      // Build options object conditionally to satisfy exactOptionalPropertyTypes
+      const addOptions: AddPackageOptions = {
         dev: flags.dev,
         global: flags.global,
         optional: flags.optional,
-        runtime: flags.runtime,
-        manager: flags.manager,
         skipIfExists: flags['skip-if-exists'],
-      });
+      };
+
+      // Only add optional properties if they have values
+      if (flags.runtime) {
+        addOptions.runtime = flags.runtime;
+      }
+      if (flags.manager) {
+        addOptions.manager = flags.manager;
+      }
+
+      // Add the package
+      const result = await packageManager.addPackage(args.package, addOptions);
 
       if (result.success) {
         this.log(chalk.green(`✅ Successfully added ${args.package}`));

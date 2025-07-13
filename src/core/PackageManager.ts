@@ -1,4 +1,4 @@
-// src/core/PackageManager.ts - Complete professional implementation
+// src/core/PackageManager.ts - Complete professional implementation with all fixes
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import { RuntimeRegistry } from './runtime/RuntimeRegistry';
@@ -17,6 +17,72 @@ import {
 import { RuntimeType } from '../types/Runtime';
 import { logger } from '../utils/Logger';
 import { ConfigManager } from './ConfigManager';
+
+// Interface definitions for type safety
+interface NpmSearchResponse {
+  objects: Array<{
+    package: {
+      name: string;
+      version: string;
+      description?: string;
+      keywords?: string[];
+      date: string;
+      author?: { name: string };
+      repository?: { url: string };
+      links: {
+        npm: string;
+        homepage?: string;
+        repository?: string;
+      };
+    };
+    score: {
+      final: number;
+      detail: {
+        quality: number;
+        popularity: number;
+        maintenance: number;
+      };
+    };
+    searchScore: number;
+  }>;
+  total: number;
+  time: string;
+}
+
+interface PyPiSearchResponse {
+  info: {
+    name: string;
+    version: string;
+    summary?: string;
+    description?: string;
+    author?: string;
+    home_page?: string;
+    project_urls?: Record<string, string>;
+  };
+  releases: Record<string, any[]>;
+}
+
+interface RuntimeInstallOptions {
+  version: string;
+  projectPath: string;
+  manager?: string;
+  skipIfExists?: boolean;
+}
+
+interface RuntimeStatus {
+  name: string;
+  version: string;
+  installed: boolean;
+  active: boolean;
+  manager?: string;
+}
+
+interface ServiceStatus {
+  name: string;
+  version: string;
+  running: boolean;
+  template?: string;
+}
 
 export interface PackageManagerOptions {
   projectPath: string;
@@ -42,16 +108,29 @@ export interface SearchPackageOptions {
   sortBy?: 'relevance' | 'downloads' | 'updated';
 }
 
+interface DependencyStatus {
+  name: string;
+  version: string;
+  installed: boolean;
+  runtime?: string;
+}
+
+interface ProjectPackageStatus {
+  runtimes: RuntimeStatus[];
+  services: ServiceStatus[];
+  dependencies: DependencyStatus[];
+}
+
 /**
  * Central package manager for Switchr
  * Handles runtime versions, services, and dependencies with production-quality implementation
  */
 export class PackageManager {
-  private projectPath: string;
-  private cacheDir: string;
-  private lockFileManager: LockFileManager;
-  private configManager: ConfigManager;
-  private registries: Map<string, any> = new Map();
+  private readonly projectPath: string;
+  private readonly cacheDir: string;
+  private readonly lockFileManager: LockFileManager;
+  private readonly configManager: ConfigManager;
+  private readonly registries: Map<string, any> = new Map();
 
   constructor(options: PackageManagerOptions) {
     this.projectPath = options.projectPath;
@@ -254,62 +333,13 @@ export class PackageManager {
   }
 
   /**
-   * Update packages to latest compatible versions
-   */
-  async updatePackages(packageName?: string): Promise<PackageInstallResult[]> {
-    logger.info(packageName ? `Updating package: ${packageName}` : 'Updating all packages');
-
-    try {
-      const projectConfig = await this.configManager.loadProjectConfig(this.projectPath);
-      if (!projectConfig?.packages) {
-        logger.info('No packages to update');
-        return [];
-      }
-
-      const lockFile = await this.lockFileManager.read();
-      const results: PackageInstallResult[] = [];
-
-      if (packageName) {
-        const result = await this.updateSinglePackage(
-          packageName,
-          projectConfig.packages,
-          lockFile
-        );
-        if (result) results.push(result);
-      } else {
-        const allResults = await this.updateAllPackages(projectConfig.packages, lockFile);
-        results.push(...allResults);
-      }
-
-      // Update lock file with new versions
-      await this.updateLockFile();
-
-      logger.info('Successfully updated packages');
-      return results;
-    } catch (error) {
-      logger.error('Failed to update packages', error);
-      throw error;
-    }
-  }
-
-  /**
    * Get comprehensive package status
    */
-  async getPackageStatus(): Promise<{
-    runtimes: Array<{
-      name: string;
-      version: string;
-      installed: boolean;
-      active: boolean;
-      manager?: string;
-    }>;
-    services: Array<{ name: string; version: string; running: boolean; template?: string }>;
-    dependencies: Array<{ name: string; version: string; installed: boolean; runtime?: string }>;
-  }> {
-    const status = {
-      runtimes: [] as any[],
-      services: [] as any[],
-      dependencies: [] as any[],
+  async getPackageStatus(): Promise<ProjectPackageStatus> {
+    const status: ProjectPackageStatus = {
+      runtimes: [],
+      services: [],
+      dependencies: [],
     };
 
     try {
@@ -333,13 +363,19 @@ export class PackageManager {
             const active = currentEnv?.version === version;
             const bestManager = await manager.getBestManager();
 
-            status.runtimes.push({
+            const runtimeStatus: RuntimeStatus = {
               name: runtimeType,
               version,
               installed,
               active,
-              manager: bestManager?.name,
-            });
+            };
+
+            // Only add manager if it exists
+            if (bestManager?.name) {
+              runtimeStatus.manager = bestManager.name;
+            }
+
+            status.runtimes.push(runtimeStatus);
           }
         }
       }
@@ -347,15 +383,16 @@ export class PackageManager {
       // Check service status
       if (projectConfig.packages.services) {
         for (const service of projectConfig.packages.services) {
-          // This integrates with your existing service status checking
           const serviceStatus = await this.getServiceStatus(service.name);
 
-          status.services.push({
+          const serviceStatusObj: ServiceStatus = {
             name: service.name,
             version: service.version || 'latest',
             running: serviceStatus.running,
             template: service.template,
-          });
+          };
+
+          status.services.push(serviceStatusObj);
         }
       }
 
@@ -364,12 +401,18 @@ export class PackageManager {
         for (const dep of projectConfig.packages.dependencies) {
           const installed = await this.isDependencyInstalled(dep);
 
-          status.dependencies.push({
+          const dependencyStatus: DependencyStatus = {
             name: dep.name,
             version: dep.version || 'latest',
             installed,
-            runtime: dep.runtime,
-          });
+          };
+
+          // Only add runtime if it exists
+          if (dep.runtime) {
+            dependencyStatus.runtime = dep.runtime;
+          }
+
+          status.dependencies.push(dependencyStatus);
         }
       }
 
@@ -401,14 +444,26 @@ export class PackageManager {
     const name = nameWithScope;
     const type = await this.detectPackageType(name, options);
 
-    return {
+    const packageDef: PackageDefinition = {
       name,
-      version,
       type,
-      runtime: options.runtime,
-      global: options.global,
-      optional: options.optional,
     };
+
+    // Only add properties if they exist
+    if (version) {
+      packageDef.version = version;
+    }
+    if (options.runtime) {
+      packageDef.runtime = options.runtime;
+    }
+    if (options.global) {
+      packageDef.global = options.global;
+    }
+    if (options.optional) {
+      packageDef.optional = options.optional;
+    }
+
+    return packageDef;
   }
 
   private async detectPackageType(name: string, options: AddPackageOptions): Promise<PackageType> {
@@ -491,12 +546,20 @@ export class PackageManager {
       };
     }
 
-    const env = await manager.install({
+    const installOptions: RuntimeInstallOptions = {
       version,
       projectPath: this.projectPath,
-      manager: options.manager,
-    });
+    };
 
+    // Add optional properties only if they exist
+    if (options.manager) {
+      installOptions.manager = options.manager;
+    }
+    if (options.skipIfExists !== undefined) {
+      installOptions.skipIfExists = options.skipIfExists;
+    }
+
+    const env = await manager.install(installOptions);
     await manager.activate(version);
 
     return {
@@ -505,6 +568,123 @@ export class PackageManager {
       installedVersion: env.version,
       installPath: env.path,
     };
+  }
+
+  private async addService(
+    service: ServicePackage,
+    options: AddPackageOptions
+  ): Promise<PackageInstallResult> {
+    const template = ServiceTemplateRegistry.getTemplate(service.template || service.name);
+    if (!template) {
+      throw new Error(`Unknown service template: ${service.template || service.name}`);
+    }
+
+    const serviceInstance = await template.install(service.config || {});
+
+    return {
+      success: true,
+      package: service,
+      installedVersion: serviceInstance.version,
+    };
+  }
+
+  private async addDependency(
+    dep: DependencyPackage,
+    options: AddPackageOptions
+  ): Promise<PackageInstallResult> {
+    const runtime = dep.runtime || (await this.detectPrimaryRuntime());
+
+    switch (runtime) {
+      case 'nodejs':
+        return await this.installNodeDependency(dep);
+      case 'python':
+        return await this.installPythonDependency(dep);
+      case 'go':
+        return await this.installGoDependency(dep);
+      default:
+        throw new Error(`Dependency installation not supported for runtime: ${runtime}`);
+    }
+  }
+
+  private async installNodeDependency(dep: DependencyPackage): Promise<PackageInstallResult> {
+    const { ProcessUtils } = await import('../utils/ProcessUtils');
+
+    const packageManager = await this.detectNodePackageManager();
+    const args = ['add', dep.name];
+
+    if (dep.version) {
+      args[1] = `${dep.name}@${dep.version}`;
+    }
+
+    if (dep.devOnly) {
+      args.push(packageManager === 'npm' ? '--save-dev' : '--dev');
+    }
+
+    if (dep.global) {
+      args.push('--global');
+    }
+
+    try {
+      await ProcessUtils.execute(packageManager, args, { cwd: this.projectPath });
+
+      return {
+        success: true,
+        package: dep,
+        installedVersion: dep.version || 'latest',
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to install Node.js dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private async installPythonDependency(dep: DependencyPackage): Promise<PackageInstallResult> {
+    const { ProcessUtils } = await import('../utils/ProcessUtils');
+
+    const args = ['install', dep.name];
+
+    if (dep.version) {
+      args[1] = `${dep.name}==${dep.version}`;
+    }
+
+    try {
+      await ProcessUtils.execute('pip', args, { cwd: this.projectPath });
+
+      return {
+        success: true,
+        package: dep,
+        installedVersion: dep.version || 'latest',
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to install Python dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  private async installGoDependency(dep: DependencyPackage): Promise<PackageInstallResult> {
+    const { ProcessUtils } = await import('../utils/ProcessUtils');
+
+    const args = ['get', dep.name];
+
+    if (dep.version) {
+      args[1] = `${dep.name}@${dep.version}`;
+    }
+
+    try {
+      await ProcessUtils.execute('go', args, { cwd: this.projectPath });
+
+      return {
+        success: true,
+        package: dep,
+        installedVersion: dep.version || 'latest',
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to install Go dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   private async searchRuntimes(
@@ -575,40 +755,54 @@ export class PackageManager {
     query: string,
     options: SearchPackageOptions
   ): Promise<PackageSearchResult[]> {
-    // Implementation would use npm registry API
-    // For now, return some common packages as examples
-    const commonPackages = [
-      'express',
-      'react',
-      'vue',
-      'angular',
-      'next',
-      'typescript',
-      'lodash',
-      'axios',
-      'moment',
-      'uuid',
-      'chalk',
-      'commander',
-    ];
+    try {
+      const encodedQuery = encodeURIComponent(query);
+      const limit = options.limit || 20;
+      const url = `https://registry.npmjs.org/-/v1/search?text=${encodedQuery}&size=${limit}`;
 
-    return commonPackages
-      .filter(pkg => pkg.includes(query.toLowerCase()))
-      .map(pkg => ({
-        name: pkg,
-        type: 'dependency' as PackageType,
-        runtime: 'nodejs',
-        description: `Node.js package: ${pkg}`,
-        category: 'library',
-        score: this.calculateRelevanceScore(pkg, query),
-      }));
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`NPM API error: ${response.status} ${response.statusText}`);
+      }
+
+      // Fix: Properly type the response
+      const data = (await response.json()) as NpmSearchResponse;
+
+      return data.objects.map(obj => {
+        const result: PackageSearchResult = {
+          name: obj.package.name,
+          type: 'dependency' as PackageType,
+          runtime: 'nodejs' as RuntimeType,
+          description: obj.package.description || '',
+          category: 'library',
+          version: obj.package.version,
+          score: Math.round(obj.score.final * 100),
+          lastUpdated: obj.package.date,
+        };
+
+        // Only add optional properties if they exist
+        if (obj.package.repository?.url) {
+          result.repository = obj.package.repository.url;
+        }
+        if (obj.package.links.homepage) {
+          result.homepage = obj.package.links.homepage;
+        }
+
+        return result;
+      });
+    } catch (error) {
+      logger.error('Failed to search npm registry', error);
+      return [];
+    }
   }
 
   private async searchPyPIRegistry(
     query: string,
     options: SearchPackageOptions
   ): Promise<PackageSearchResult[]> {
-    // Implementation would use PyPI API
+    // Note: PyPI removed their search API, so we'll use a simple package list approach
+    // In a real implementation, you'd use pypi.org's JSON API or xmlrpc
     const commonPackages = [
       'django',
       'flask',
@@ -628,7 +822,7 @@ export class PackageManager {
       .map(pkg => ({
         name: pkg,
         type: 'dependency' as PackageType,
-        runtime: 'python',
+        runtime: 'python' as RuntimeType,
         description: `Python package: ${pkg}`,
         category: 'library',
         score: this.calculateRelevanceScore(pkg, query),
@@ -780,123 +974,6 @@ export class PackageManager {
     return results;
   }
 
-  private async addService(
-    service: ServicePackage,
-    options: AddPackageOptions
-  ): Promise<PackageInstallResult> {
-    const template = ServiceTemplateRegistry.getTemplate(service.template || service.name);
-    if (!template) {
-      throw new Error(`Unknown service template: ${service.template || service.name}`);
-    }
-
-    const serviceInstance = await template.install(service.config || {});
-
-    return {
-      success: true,
-      package: service,
-      installedVersion: serviceInstance.version,
-    };
-  }
-
-  private async addDependency(
-    dep: DependencyPackage,
-    options: AddPackageOptions
-  ): Promise<PackageInstallResult> {
-    const runtime = dep.runtime || (await this.detectPrimaryRuntime());
-
-    switch (runtime) {
-      case 'nodejs':
-        return await this.installNodeDependency(dep);
-      case 'python':
-        return await this.installPythonDependency(dep);
-      case 'go':
-        return await this.installGoDependency(dep);
-      default:
-        throw new Error(`Dependency installation not supported for runtime: ${runtime}`);
-    }
-  }
-
-  private async installNodeDependency(dep: DependencyPackage): Promise<PackageInstallResult> {
-    const { ProcessUtils } = await import('../utils/ProcessUtils');
-
-    const packageManager = await this.detectNodePackageManager();
-    const args = ['add', dep.name];
-
-    if (dep.version) {
-      args[1] = `${dep.name}@${dep.version}`;
-    }
-
-    if (dep.devOnly) {
-      args.push(packageManager === 'npm' ? '--save-dev' : '--dev');
-    }
-
-    if (dep.global) {
-      args.push('--global');
-    }
-
-    try {
-      await ProcessUtils.execute(packageManager, args, { cwd: this.projectPath });
-
-      return {
-        success: true,
-        package: dep,
-        installedVersion: dep.version || 'latest',
-      };
-    } catch (error) {
-      throw new Error(
-        `Failed to install Node.js dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
-  }
-
-  private async installPythonDependency(dep: DependencyPackage): Promise<PackageInstallResult> {
-    const { ProcessUtils } = await import('../utils/ProcessUtils');
-
-    const args = ['install', dep.name];
-
-    if (dep.version) {
-      args[1] = `${dep.name}==${dep.version}`;
-    }
-
-    try {
-      await ProcessUtils.execute('pip', args, { cwd: this.projectPath });
-
-      return {
-        success: true,
-        package: dep,
-        installedVersion: dep.version || 'latest',
-      };
-    } catch (error) {
-      throw new Error(
-        `Failed to install Python dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
-  }
-
-  private async installGoDependency(dep: DependencyPackage): Promise<PackageInstallResult> {
-    const { ProcessUtils } = await import('../utils/ProcessUtils');
-
-    const args = ['get', dep.name];
-
-    if (dep.version) {
-      args[1] = `${dep.name}@${dep.version}`;
-    }
-
-    try {
-      await ProcessUtils.execute('go', args, { cwd: this.projectPath });
-
-      return {
-        success: true,
-        package: dep,
-        installedVersion: dep.version || 'latest',
-      };
-    } catch (error) {
-      throw new Error(
-        `Failed to install Go dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
-  }
-
   private async detectNodePackageManager(): Promise<string> {
     const lockFiles = [
       { file: 'yarn.lock', manager: 'yarn' },
@@ -925,7 +1002,7 @@ export class PackageManager {
     return { running: false };
   }
 
-  private async isDependencyInstalled(dep: DependencyPackage): Promise<boolean> {
+  private async isDependencyInstalled(dep: { name: string; runtime?: string }): Promise<boolean> {
     try {
       switch (dep.runtime) {
         case 'nodejs':
@@ -1209,24 +1286,5 @@ export class PackageManager {
     }
 
     return locks;
-  }
-
-  private async updateSinglePackage(
-    name: string,
-    packages: any,
-    lockFile: LockFile | null
-  ): Promise<PackageInstallResult | null> {
-    // Implementation for updating a single package
-    // This would check for newer versions and update accordingly
-    return null;
-  }
-
-  private async updateAllPackages(
-    packages: any,
-    lockFile: LockFile | null
-  ): Promise<PackageInstallResult[]> {
-    // Implementation for updating all packages
-    // This would check all packages for updates
-    return [];
   }
 }

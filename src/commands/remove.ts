@@ -1,4 +1,4 @@
-// src/commands/remove.ts - Complete implementation
+// src/commands/remove.ts - Fixed version with exactOptionalPropertyTypes support
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import { ConfigManager } from '../core/ConfigManager';
@@ -6,6 +6,14 @@ import { PackageManager } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 import { logger } from '../utils/Logger';
+
+interface PackageExistsResult {
+  found: boolean;
+  type?: string;
+  version?: string;
+  description?: string;
+  installedAt?: string;
+}
 
 export default class Remove extends Command {
   static override description = 'Remove packages, runtimes, or services from the current project';
@@ -117,6 +125,14 @@ export default class Remove extends Command {
       this.log(chalk.gray(`   Version: ${packageExists.version}`));
     }
 
+    if (packageExists.description) {
+      this.log(chalk.gray(`   Description: ${packageExists.description}`));
+    }
+
+    if (packageExists.installedAt) {
+      this.log(chalk.gray(`   Installed: ${packageExists.installedAt}`));
+    }
+
     // Show dependent services/packages
     const dependents = await this.findDependents(packageName, project);
     if (dependents.length > 0) {
@@ -175,33 +191,55 @@ export default class Remove extends Command {
   private async checkPackageExists(
     packageName: string,
     project: any
-  ): Promise<{
-    found: boolean;
-    type?: string;
-    version?: string;
-  }> {
+  ): Promise<PackageExistsResult> {
     if (!project.packages) {
       return { found: false };
     }
 
     // Check runtimes
     if (project.packages.runtimes && project.packages.runtimes[packageName]) {
-      return {
+      const result: PackageExistsResult = {
         found: true,
         type: 'runtime',
         version: project.packages.runtimes[packageName],
+        description: `${packageName} runtime environment`,
       };
+
+      // Only add installedAt if we can determine it
+      try {
+        const installDate = await this.getInstallDate(packageName, 'runtime');
+        if (installDate) {
+          result.installedAt = installDate;
+        }
+      } catch {
+        // Ignore errors getting install date
+      }
+
+      return result;
     }
 
     // Check services
     if (project.packages.services) {
       const service = project.packages.services.find((s: any) => s.name === packageName);
       if (service) {
-        return {
+        const result: PackageExistsResult = {
           found: true,
           type: 'service',
           version: service.version,
+          description: `${service.template || packageName} service`,
         };
+
+        // Only add installedAt if we can determine it
+        try {
+          const installDate = await this.getInstallDate(packageName, 'service');
+          if (installDate) {
+            result.installedAt = installDate;
+          }
+        } catch {
+          // Ignore errors getting install date
+        }
+
+        return result;
       }
     }
 
@@ -209,15 +247,38 @@ export default class Remove extends Command {
     if (project.packages.dependencies) {
       const dependency = project.packages.dependencies.find((d: any) => d.name === packageName);
       if (dependency) {
-        return {
+        const result: PackageExistsResult = {
           found: true,
           type: 'dependency',
           version: dependency.version,
+          description: `${dependency.runtime || 'unknown'} dependency`,
         };
+
+        // Only add installedAt if we can determine it
+        try {
+          const installDate = await this.getInstallDate(packageName, 'dependency');
+          if (installDate) {
+            result.installedAt = installDate;
+          }
+        } catch {
+          // Ignore errors getting install date
+        }
+
+        return result;
       }
     }
 
     return { found: false };
+  }
+
+  private async getInstallDate(packageName: string, type: string): Promise<string | null> {
+    try {
+      // This would integrate with your package managers to get actual install dates
+      // For now, return null to avoid undefined issues
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   private async findDependents(
