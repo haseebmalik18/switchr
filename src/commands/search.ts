@@ -1,4 +1,4 @@
-// src/commands/search.ts - Production-quality implementation
+// src/commands/search.ts - Updated with real registry implementations
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -6,6 +6,8 @@ import { ConfigManager } from '../core/ConfigManager';
 import { PackageManager, type SearchPackageOptions } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
+import { NPMRegistry } from '../core/registry/NPMRegistry';
+import { PyPIRegistry } from '../core/registry/PyPIRegistry';
 import { logger } from '../utils/Logger';
 import { PackageType, PackageSearchResult } from '../types/Package';
 import { RuntimeType } from '../types/Runtime';
@@ -18,7 +20,8 @@ export default class Search extends Command {
     '<%= config.bin %> <%= command.id %> node --type runtime',
     '<%= config.bin %> <%= command.id %> database --type service',
     '<%= config.bin %> <%= command.id %> express --type dependency --runtime nodejs',
-    '<%= config.bin %> <%= command.id %> python --category runtime --limit 10',
+    '<%= config.bin %> <%= command.id %> django --runtime python --limit 10',
+    '<%= config.bin %> <%= command.id %> redis --category cache',
   ];
 
   static override args = {
@@ -70,6 +73,10 @@ export default class Search extends Command {
       description: 'Show installation status',
       default: false,
     }),
+    'include-stats': Flags.boolean({
+      description: 'Include download statistics (slower)',
+      default: false,
+    }),
   };
 
   public async run(): Promise<void> {
@@ -80,14 +87,8 @@ export default class Search extends Command {
 
       await this.initializeRegistries();
 
-      const configManager = ConfigManager.getInstance();
-      const packageManager = new PackageManager({
-        projectPath: process.cwd(),
-        cacheDir: configManager.getConfigDir(),
-      });
-
       const searchOptions = this.buildSearchOptions(flags);
-      const results = await packageManager.searchPackages(args.query, searchOptions);
+      const results = await this.performSearch(args.query, searchOptions, flags);
 
       spinner.stop();
 
@@ -141,6 +142,393 @@ export default class Search extends Command {
     }
 
     return options;
+  }
+
+  private async performSearch(
+    query: string,
+    options: SearchPackageOptions,
+    flags: any
+  ): Promise<PackageSearchResult[]> {
+    const results: PackageSearchResult[] = [];
+
+    // Search runtimes
+    if (!options.type || options.type === 'runtime') {
+      const runtimeResults = await this.searchRuntimes(query, options);
+      results.push(...runtimeResults);
+    }
+
+    // Search services
+    if (!options.type || options.type === 'service') {
+      const serviceResults = await this.searchServices(query, options);
+      results.push(...serviceResults);
+    }
+
+    // Search dependencies
+    if (!options.type || options.type === 'dependency') {
+      const depResults = await this.searchDependencies(query, options, flags);
+      results.push(...depResults);
+    }
+
+    // Sort and limit results
+    const sortedResults = this.sortSearchResults(results, options.sortBy || 'relevance');
+    return sortedResults.slice(0, options.limit || 20);
+  }
+
+  private async searchRuntimes(
+    query: string,
+    options: SearchPackageOptions
+  ): Promise<PackageSearchResult[]> {
+    const results: PackageSearchResult[] = [];
+    const runtimeTypes = RuntimeRegistry.getRegisteredTypes();
+
+    for (const type of runtimeTypes) {
+      if (type.toLowerCase().includes(query.toLowerCase())) {
+        try {
+          // Get available versions for this runtime
+          const manager = RuntimeRegistry.create(type, process.cwd(), '/tmp');
+          const versions = await manager.listAvailable();
+
+          results.push({
+            name: type,
+            type: 'runtime',
+            description: `${type} runtime environment`,
+            category: 'runtime',
+            version: versions[0] || 'latest', // Latest version
+            score: this.calculateRelevanceScore(type, query),
+          });
+        } catch (error) {
+          logger.debug(`Failed to get runtime info for ${type}`, error);
+          // Add basic result without version info
+          results.push({
+            name: type,
+            type: 'runtime',
+            description: `${type} runtime environment`,
+            category: 'runtime',
+            score: this.calculateRelevanceScore(type, query),
+          });
+        }
+      }
+    }
+
+    return results;
+  }
+
+  private async searchServices(
+    query: string,
+    options: SearchPackageOptions
+  ): Promise<PackageSearchResult[]> {
+    const templates = ServiceTemplateRegistry.searchTemplates(query);
+
+    return templates
+      .filter(template => !options.category || template.category === options.category)
+      .map(template => ({
+        name: template.name,
+        type: 'service' as PackageType,
+        description: template.description,
+        category: template.category,
+        version: template.version,
+        score: this.calculateRelevanceScore(template.name, query),
+      }));
+  }
+
+  private async searchDependencies(
+    query: string,
+    options: SearchPackageOptions,
+    flags: any
+  ): Promise<PackageSearchResult[]> {
+    const results: PackageSearchResult[] = [];
+
+    // Search npm registry for Node.js packages
+    if (!options.runtime || options.runtime === 'nodejs') {
+      try {
+        const npmResults = await NPMRegistry.searchPackages(query, {
+          limit: Math.min(options.limit || 20, 50),
+          sortBy: options.sortBy,
+        });
+
+        // Add download stats if requested
+        if (flags['include-stats']) {
+          for (const result of npmResults) {
+            try {
+              const downloads = await NPMRegistry.getDownloadStats(result.name);
+              if (downloads !== null) {
+                result.downloads = downloads;
+              }
+            } catch (error) {
+              logger.debug(`Failed to get download stats for ${result.name}`, error);
+            }
+          }
+        }
+
+        results.push(...npmResults);
+      } catch (error) {
+        logger.error('NPM registry search failed', error);
+        // Add fallback results
+        results.push(...this.getFallbackNpmResults(query));
+      }
+    }
+
+    // Search PyPI for Python packages
+    if (!options.runtime || options.runtime === 'python') {
+      try {
+        const pypiResults = await PyPIRegistry.searchPackages(query, {
+          limit: Math.min(options.limit || 20, 50),
+          sortBy: options.sortBy,
+        });
+
+        // Add download stats if requested
+        if (flags['include-stats']) {
+          for (const result of pypiResults) {
+            try {
+              const downloads = await PyPIRegistry.getDownloadStats(result.name);
+              if (downloads !== null) {
+                result.downloads = downloads;
+              }
+            } catch (error) {
+              logger.debug(`Failed to get download stats for ${result.name}`, error);
+            }
+          }
+        }
+
+        results.push(...pypiResults);
+      } catch (error) {
+        logger.error('PyPI registry search failed', error);
+        // Add fallback results
+        results.push(...this.getFallbackPypiResults(query));
+      }
+    }
+
+    // Add other runtime searches (Go, Java, etc.) with basic implementations
+    if (!options.runtime || options.runtime === 'go') {
+      results.push(...this.searchGoPackages(query));
+    }
+
+    if (!options.runtime || options.runtime === 'java') {
+      results.push(...this.searchJavaPackages(query));
+    }
+
+    if (!options.runtime || options.runtime === 'rust') {
+      results.push(...this.searchRustPackages(query));
+    }
+
+    return results;
+  }
+
+  private getFallbackNpmResults(query: string): PackageSearchResult[] {
+    const commonNpmPackages = [
+      'express',
+      'react',
+      'vue',
+      'angular',
+      'next',
+      'typescript',
+      'webpack',
+      'babel',
+      'eslint',
+      'prettier',
+      'jest',
+      'mocha',
+      'axios',
+      'lodash',
+      'moment',
+      'dayjs',
+      'uuid',
+      'cors',
+      'dotenv',
+      'nodemon',
+      'concurrently',
+    ];
+
+    return commonNpmPackages
+      .filter(pkg => pkg.includes(query.toLowerCase()) || query.toLowerCase().includes(pkg))
+      .map(pkg => ({
+        name: pkg,
+        type: 'dependency' as PackageType,
+        runtime: 'nodejs' as RuntimeType,
+        description: `Popular Node.js package: ${pkg}`,
+        category: 'library',
+        score: this.calculateRelevanceScore(pkg, query),
+      }));
+  }
+
+  private getFallbackPypiResults(query: string): PackageSearchResult[] {
+    const commonPypiPackages = [
+      'django',
+      'flask',
+      'fastapi',
+      'requests',
+      'numpy',
+      'pandas',
+      'matplotlib',
+      'scipy',
+      'scikit-learn',
+      'tensorflow',
+      'torch',
+      'opencv-python',
+      'pillow',
+      'beautifulsoup4',
+      'selenium',
+      'pytest',
+      'black',
+      'flake8',
+    ];
+
+    return commonPypiPackages
+      .filter(pkg => pkg.includes(query.toLowerCase()) || query.toLowerCase().includes(pkg))
+      .map(pkg => ({
+        name: pkg,
+        type: 'dependency' as PackageType,
+        runtime: 'python' as RuntimeType,
+        description: `Popular Python package: ${pkg}`,
+        category: 'library',
+        score: this.calculateRelevanceScore(pkg, query),
+      }));
+  }
+
+  private searchGoPackages(query: string): PackageSearchResult[] {
+    const commonGoPackages = [
+      'gin-gonic/gin',
+      'gorilla/mux',
+      'echo',
+      'fiber',
+      'gorm',
+      'mongo-driver',
+      'redis',
+      'viper',
+      'cobra',
+      'logrus',
+      'zap',
+      'testify',
+      'jwt-go',
+    ];
+
+    return commonGoPackages
+      .filter(pkg => pkg.includes(query.toLowerCase()) || query.toLowerCase().includes(pkg))
+      .map(pkg => ({
+        name: pkg,
+        type: 'dependency' as PackageType,
+        runtime: 'go' as RuntimeType,
+        description: `Go package: ${pkg}`,
+        category: 'library',
+        score: this.calculateRelevanceScore(pkg, query),
+      }));
+  }
+
+  private searchJavaPackages(query: string): PackageSearchResult[] {
+    const commonJavaPackages = [
+      'spring-boot-starter',
+      'spring-boot-starter-web',
+      'spring-boot-starter-data-jpa',
+      'junit',
+      'mockito',
+      'jackson',
+      'gson',
+      'apache-commons',
+      'guava',
+      'slf4j',
+    ];
+
+    return commonJavaPackages
+      .filter(pkg => pkg.includes(query.toLowerCase()) || query.toLowerCase().includes(pkg))
+      .map(pkg => ({
+        name: pkg,
+        type: 'dependency' as PackageType,
+        runtime: 'java' as RuntimeType,
+        description: `Java package: ${pkg}`,
+        category: 'library',
+        score: this.calculateRelevanceScore(pkg, query),
+      }));
+  }
+
+  private searchRustPackages(query: string): PackageSearchResult[] {
+    const commonRustPackages = [
+      'serde',
+      'tokio',
+      'clap',
+      'reqwest',
+      'anyhow',
+      'thiserror',
+      'log',
+      'env_logger',
+      'chrono',
+      'uuid',
+      'regex',
+      'rand',
+      'diesel',
+    ];
+
+    return commonRustPackages
+      .filter(pkg => pkg.includes(query.toLowerCase()) || query.toLowerCase().includes(pkg))
+      .map(pkg => ({
+        name: pkg,
+        type: 'dependency' as PackageType,
+        runtime: 'rust' as RuntimeType,
+        description: `Rust crate: ${pkg}`,
+        category: 'library',
+        score: this.calculateRelevanceScore(pkg, query),
+      }));
+  }
+
+  private calculateRelevanceScore(name: string, query: string): number {
+    const lowerName = name.toLowerCase();
+    const lowerQuery = query.toLowerCase();
+
+    // Exact match gets highest score
+    if (lowerName === lowerQuery) return 100;
+
+    // Starts with query gets high score
+    if (lowerName.startsWith(lowerQuery)) return 80;
+
+    // Contains query gets medium score
+    if (lowerName.includes(lowerQuery)) return 60;
+
+    // Fuzzy match gets lower score
+    const distance = this.levenshteinDistance(lowerName, lowerQuery);
+    return Math.max(0, 40 - distance * 5);
+  }
+
+  private levenshteinDistance(str1: string, str2: string): number {
+    const matrix = Array(str2.length + 1)
+      .fill(null)
+      .map(() => Array(str1.length + 1).fill(null));
+
+    for (let i = 0; i <= str1.length; i++) matrix[0][i] = i;
+    for (let j = 0; j <= str2.length; j++) matrix[j][0] = j;
+
+    for (let j = 1; j <= str2.length; j++) {
+      for (let i = 1; i <= str1.length; i++) {
+        const indicator = str1[i - 1] === str2[j - 1] ? 0 : 1;
+        matrix[j][i] = Math.min(
+          matrix[j][i - 1] + 1,
+          matrix[j - 1][i] + 1,
+          matrix[j - 1][i - 1] + indicator
+        );
+      }
+    }
+
+    return matrix[str2.length][str1.length];
+  }
+
+  private sortSearchResults(
+    results: PackageSearchResult[],
+    sortBy: 'relevance' | 'downloads' | 'updated' | 'name'
+  ): PackageSearchResult[] {
+    switch (sortBy) {
+      case 'relevance':
+        return results.sort((a, b) => (b.score || 0) - (a.score || 0));
+      case 'downloads':
+        return results.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
+      case 'updated':
+        return results.sort((a, b) => {
+          const aDate = new Date(a.lastUpdated || 0);
+          const bDate = new Date(b.lastUpdated || 0);
+          return bDate.getTime() - aDate.getTime();
+        });
+      case 'name':
+        return results.sort((a, b) => a.name.localeCompare(b.name));
+      default:
+        return results;
+    }
   }
 
   private isValidPackageType(type: string): type is PackageType {
@@ -267,6 +655,12 @@ export default class Search extends Command {
       line = `  ${statusIcon} ${nameColor(pkg.name)}${versionInfo}${scoreInfo}`;
     }
 
+    // Add download info if available
+    if (pkg.downloads && pkg.downloads > 0) {
+      const downloadInfo = chalk.cyan(` (${this.formatNumber(pkg.downloads)} downloads/month)`);
+      line += downloadInfo;
+    }
+
     this.log(line);
 
     if (pkg.description) {
@@ -295,10 +689,6 @@ export default class Search extends Command {
       await this.showRuntimeDetails(pkg);
     }
 
-    if (pkg.downloads) {
-      this.log(chalk.gray(`    Downloads: ${this.formatNumber(pkg.downloads)}`));
-    }
-
     if (pkg.lastUpdated) {
       const date = new Date(pkg.lastUpdated);
       this.log(chalk.gray(`    Last updated: ${this.formatDate(date)}`));
@@ -310,6 +700,10 @@ export default class Search extends Command {
 
     if (pkg.homepage && pkg.homepage !== pkg.repository) {
       this.log(chalk.gray(`    Homepage: ${pkg.homepage}`));
+    }
+
+    if (pkg.keywords?.length) {
+      this.log(chalk.gray(`    Keywords: ${pkg.keywords.slice(0, 5).join(', ')}`));
     }
   }
 
@@ -432,6 +826,12 @@ export default class Search extends Command {
     this.log(
       chalk.gray(`   • Filter results: ${chalk.white('switchr search <query> --type <type>')}`)
     );
+
+    if (flags['include-stats']) {
+      this.log(chalk.gray(`   • Download stats included for supported registries`));
+    } else {
+      this.log(chalk.gray(`   • Add --include-stats for download statistics (slower)`));
+    }
 
     if (resultCount >= flags.limit) {
       this.log(chalk.yellow(`\n💡 Showing ${flags.limit} results. Use --limit to see more.`));

@@ -1,9 +1,14 @@
-// src/core/service/ServiceTemplateRegistry.ts - Complete production implementation
+// src/core/service/ServiceTemplateRegistry.ts - Fixed export/import issues
 import { ServiceTemplate, ServiceTemplateBase } from './ServiceTemplate';
-import { PostgreSQLTemplate } from './templates/POSTgreSQLTemplate';
+import { logger } from '../../utils/Logger';
+
+// Import all service templates
+import { PostgreSQLTemplate } from './templates/PostgreSQLTemplate';
 import { RedisTemplate } from './templates/RedisTemplate';
 import { MongoDBTemplate } from './templates/MongoDBTemplate';
-import { logger } from '../../utils/Logger';
+import { MySQLTemplate } from './templates/MySQLTemplate';
+import { NginxTemplate } from './templates/NginxTemplate';
+import { ElasticsearchTemplate } from './templates/ElasticsearchTemplate';
 
 export class ServiceTemplateRegistry {
   private static templates = new Map<string, ServiceTemplateBase>();
@@ -19,6 +24,10 @@ export class ServiceTemplateRegistry {
       this.register('redis', new RedisTemplate());
       this.register('mongodb', new MongoDBTemplate());
       this.register('mongo', new MongoDBTemplate()); // Alias
+      this.register('mysql', new MySQLTemplate());
+      this.register('nginx', new NginxTemplate());
+      this.register('elasticsearch', new ElasticsearchTemplate());
+      this.register('elastic', new ElasticsearchTemplate()); // Alias
 
       this.initialized = true;
       logger.debug(`Initialized ${this.templates.size} service templates`);
@@ -62,11 +71,11 @@ export class ServiceTemplateRegistry {
 
   static getTemplatesByProjectType(projectType: string): ServiceTemplate[] {
     const suggestions: Record<string, string[]> = {
-      nodejs: ['postgresql', 'redis', 'mongodb'],
-      python: ['postgresql', 'redis', 'mongodb'],
-      java: ['postgresql', 'redis'],
-      go: ['postgresql', 'redis', 'mongodb'],
-      rust: ['postgresql', 'redis'],
+      nodejs: ['postgresql', 'redis', 'mongodb', 'nginx'],
+      python: ['postgresql', 'redis', 'mongodb', 'elasticsearch'],
+      java: ['postgresql', 'redis', 'mysql', 'elasticsearch'],
+      go: ['postgresql', 'redis', 'mongodb', 'nginx'],
+      rust: ['postgresql', 'redis', 'nginx'],
     };
 
     const templateNames = suggestions[projectType] || [];
@@ -142,7 +151,7 @@ export class ServiceTemplateRegistry {
     });
 
     // Mock popularity data - in real implementation would track usage
-    const mostPopular = ['postgresql', 'redis', 'mongodb'];
+    const mostPopular = ['postgresql', 'redis', 'mongodb', 'nginx', 'mysql'];
 
     return {
       totalTemplates: templates.length,
@@ -221,7 +230,7 @@ export class ServiceTemplateRegistry {
   /**
    * Get template suggestions based on project analysis
    */
-  static suggestTemplates(projectPath: string): Promise<ServiceTemplate[]> {
+  static async suggestTemplates(projectPath: string): Promise<ServiceTemplate[]> {
     return new Promise(async resolve => {
       try {
         // This would integrate with ProjectDetector to analyze the project
@@ -239,5 +248,33 @@ export class ServiceTemplateRegistry {
         resolve([]);
       }
     });
+  }
+
+  /**
+   * Get registry information for debugging
+   */
+  static getRegistryInfo(): {
+    initialized: boolean;
+    templateCount: number;
+    templateNames: string[];
+    categories: string[];
+  } {
+    const templates = this.getAllTemplates();
+    const categories = Array.from(new Set(templates.map(t => t.category)));
+
+    return {
+      initialized: this.initialized,
+      templateCount: this.templates.size,
+      templateNames: Array.from(this.templates.keys()),
+      categories,
+    };
+  }
+
+  /**
+   * Force re-initialization (useful for testing)
+   */
+  static async forceReinitialize(): Promise<void> {
+    this.clear();
+    await this.initialize();
   }
 }
