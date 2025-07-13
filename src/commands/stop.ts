@@ -1,3 +1,4 @@
+// src/commands/stop.ts - Complete file with TypeScript fixes
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -10,7 +11,7 @@ interface RunningService {
   name: string;
   pid: number;
   port?: number;
-  command: string;
+  command: string; // Keep as required string, but provide fallback
 }
 
 export default class Stop extends Command {
@@ -118,16 +119,17 @@ export default class Stop extends Command {
             name: service.name,
             pid,
             port: service.port,
-            command: service.command,
+            command: service.command || `port-${service.port}`, // Provide fallback
           });
         }
-      } else {
+      } else if (service.command) {
+        // Add explicit check for command
         const pid = await this.findProcessByCommand(service.command);
         if (pid) {
           running.push({
             name: service.name,
             pid,
-            command: service.command,
+            command: service.command, // Guaranteed to be string here
           });
         }
       }
@@ -173,7 +175,9 @@ export default class Stop extends Command {
 
     services.forEach(service => {
       this.log(chalk.gray(`   • ${chalk.white(service.name)} (PID: ${service.pid})`));
-      this.log(chalk.gray(`     Command: ${service.command}`));
+      if (service.command && !service.command.startsWith('port-')) {
+        this.log(chalk.gray(`     Command: ${service.command}`));
+      }
       if (service.port) {
         this.log(chalk.gray(`     Port: ${service.port}`));
       }

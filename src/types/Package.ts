@@ -1,3 +1,4 @@
+// src/types/Package.ts - Enhanced with proper types
 export type PackageType = 'runtime' | 'dependency' | 'service' | 'tool';
 
 export interface PackageDefinition {
@@ -9,6 +10,8 @@ export interface PackageDefinition {
   optional?: boolean;
   devOnly?: boolean;
   description?: string;
+  category?: string;
+  registry?: string;
 }
 
 export interface RuntimePackage extends PackageDefinition {
@@ -16,6 +19,7 @@ export interface RuntimePackage extends PackageDefinition {
   installPath?: string;
   binPath?: string;
   envVars?: Record<string, string>;
+  manager?: string; // nvm, fnm, asdf, etc.
 }
 
 export interface ServicePackage extends PackageDefinition {
@@ -25,6 +29,33 @@ export interface ServicePackage extends PackageDefinition {
   healthCheck?: string;
   dependencies?: string[];
   ports?: number[];
+  image?: string;
+  volumes?: string[];
+}
+
+export interface DependencyPackage extends PackageDefinition {
+  type: 'dependency';
+  runtime: string; // Required for dependencies
+  packageManager?: string; // npm, pip, cargo, etc.
+}
+
+export interface PackageSearchResult extends PackageDefinition {
+  downloads?: number;
+  repository?: string;
+  homepage?: string;
+  keywords?: string[];
+  lastUpdated?: string;
+  maintainers?: string[];
+  score?: number;
+}
+
+export interface PackageInstallResult {
+  success: boolean;
+  package: PackageDefinition;
+  installedVersion?: string;
+  installPath?: string;
+  error?: string;
+  warnings?: string[];
 }
 
 export interface LockFile {
@@ -39,6 +70,7 @@ export interface LockFile {
       resolved: string;
       integrity?: string;
       path?: string;
+      manager?: string;
     }
   >;
   packages: Record<
@@ -48,6 +80,7 @@ export interface LockFile {
       resolved?: string;
       integrity?: string;
       dependencies?: string[];
+      runtime?: string;
     }
   >;
   services: Record<
@@ -58,6 +91,7 @@ export interface LockFile {
       config: Record<string, any>;
       image?: string;
       digest?: string;
+      ports?: number[];
     }
   >;
 }

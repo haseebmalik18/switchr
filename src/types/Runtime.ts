@@ -1,4 +1,5 @@
-export type RuntimeType = 'nodejs' | 'python' | 'go' | 'java' | 'rust' | 'php';
+// src/types/Runtime.ts - Enhanced runtime types
+export type RuntimeType = 'nodejs' | 'python' | 'go' | 'java' | 'rust' | 'php' | 'ruby' | 'dotnet';
 
 export interface RuntimeVersion {
   version: string;
@@ -7,6 +8,7 @@ export interface RuntimeVersion {
   patch: number;
   prerelease?: string;
   build?: string;
+  lts?: boolean;
 }
 
 export interface RuntimeEnvironment {
@@ -17,6 +19,8 @@ export interface RuntimeEnvironment {
   envVars: Record<string, string>;
   isActive: boolean;
   installedAt?: Date;
+  manager?: string;
+  packageManager?: string;
 }
 
 export interface RuntimeInstallOptions {
@@ -25,14 +29,7 @@ export interface RuntimeInstallOptions {
   global?: boolean;
   skipIfExists?: boolean;
   env?: Record<string, string>;
-}
-
-export interface RuntimeManagerConfig {
-  cacheDir: string;
-  projectPath: string;
-  preferredManager?: string;
-  timeout?: number;
-  retries?: number;
+  manager?: string; // Preferred version manager
 }
 
 export interface VersionManagerInfo {
@@ -41,4 +38,13 @@ export interface VersionManagerInfo {
   available: boolean;
   version?: string;
   priority: number;
+  supportedRuntimes: RuntimeType[];
+}
+
+export interface RuntimeManagerConfig {
+  cacheDir: string;
+  projectPath: string;
+  preferredManager?: string;
+  timeout?: number;
+  retries?: number;
 }
