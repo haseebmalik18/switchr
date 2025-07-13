@@ -28,7 +28,7 @@ export class VersionManagerDetector {
         results.push({
           ...manager,
           available,
-          version,
+          ...(version && { version }),
         });
       } catch (error) {
         results.push({
@@ -70,33 +70,58 @@ export class VersionManagerDetector {
     switch (runtimeType) {
       case 'nodejs':
         return [
-          { name: 'fnm', command: 'fnm', priority: 10 },
-          { name: 'nvm', command: 'nvm', priority: 9 },
-          { name: 'asdf', command: 'asdf', priority: 8 },
-          { name: 'volta', command: 'volta', priority: 7 },
-          { name: 'n', command: 'n', priority: 6 },
+          { name: 'fnm', command: 'fnm', priority: 10, supportedRuntimes: ['nodejs'] },
+          { name: 'nvm', command: 'nvm', priority: 9, supportedRuntimes: ['nodejs'] },
+          {
+            name: 'asdf',
+            command: 'asdf',
+            priority: 8,
+            supportedRuntimes: ['nodejs', 'python', 'go', 'java', 'rust'],
+          },
+          { name: 'volta', command: 'volta', priority: 7, supportedRuntimes: ['nodejs'] },
+          { name: 'n', command: 'n', priority: 6, supportedRuntimes: ['nodejs'] },
         ];
       case 'python':
         return [
-          { name: 'pyenv', command: 'pyenv', priority: 10 },
-          { name: 'asdf', command: 'asdf', priority: 9 },
-          { name: 'conda', command: 'conda', priority: 8 },
+          { name: 'pyenv', command: 'pyenv', priority: 10, supportedRuntimes: ['python'] },
+          {
+            name: 'asdf',
+            command: 'asdf',
+            priority: 9,
+            supportedRuntimes: ['nodejs', 'python', 'go', 'java', 'rust'],
+          },
+          { name: 'conda', command: 'conda', priority: 8, supportedRuntimes: ['python'] },
         ];
       case 'go':
         return [
-          { name: 'g', command: 'g', priority: 10 },
-          { name: 'asdf', command: 'asdf', priority: 9 },
+          { name: 'g', command: 'g', priority: 10, supportedRuntimes: ['go'] },
+          {
+            name: 'asdf',
+            command: 'asdf',
+            priority: 9,
+            supportedRuntimes: ['nodejs', 'python', 'go', 'java', 'rust'],
+          },
         ];
       case 'java':
         return [
-          { name: 'jenv', command: 'jenv', priority: 10 },
-          { name: 'asdf', command: 'asdf', priority: 9 },
-          { name: 'sdkman', command: 'sdk', priority: 8 },
+          { name: 'jenv', command: 'jenv', priority: 10, supportedRuntimes: ['java'] },
+          {
+            name: 'asdf',
+            command: 'asdf',
+            priority: 9,
+            supportedRuntimes: ['nodejs', 'python', 'go', 'java', 'rust'],
+          },
+          { name: 'sdkman', command: 'sdk', priority: 8, supportedRuntimes: ['java'] },
         ];
       case 'rust':
         return [
-          { name: 'rustup', command: 'rustup', priority: 10 },
-          { name: 'asdf', command: 'asdf', priority: 9 },
+          { name: 'rustup', command: 'rustup', priority: 10, supportedRuntimes: ['rust'] },
+          {
+            name: 'asdf',
+            command: 'asdf',
+            priority: 9,
+            supportedRuntimes: ['nodejs', 'python', 'go', 'java', 'rust'],
+          },
         ];
       default:
         return [];

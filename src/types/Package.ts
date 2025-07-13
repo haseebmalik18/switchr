@@ -1,5 +1,8 @@
-// src/types/Package.ts - Enhanced with proper types
+// src/types/Package.ts - Fixed with proper exports
 export type PackageType = 'runtime' | 'dependency' | 'service' | 'tool';
+
+// Re-export RuntimeType from Runtime.ts for convenience
+export type { RuntimeType } from './Runtime';
 
 export interface PackageDefinition {
   name: string;

@@ -1,3 +1,4 @@
+// src/commands/switch.ts - Production-quality implementation
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -11,6 +12,14 @@ interface RunningService {
   name: string;
   pid: number;
   port?: number;
+  command?: string;
+}
+
+interface ServiceStartResult {
+  service: string;
+  success: boolean;
+  error?: string;
+  phase?: number;
 }
 
 export default class Switch extends Command {
@@ -20,6 +29,7 @@ export default class Switch extends Command {
     '<%= config.bin %> <%= command.id %> my-project',
     '<%= config.bin %> <%= command.id %> my-project --force',
     '<%= config.bin %> <%= command.id %> my-project --no-stop',
+    '<%= config.bin %> <%= command.id %> my-project --no-start',
   ];
 
   static override args = {
@@ -46,6 +56,10 @@ export default class Switch extends Command {
     'dry-run': Flags.boolean({
       description: 'Show what would be done without executing',
       default: false,
+    }),
+    timeout: Flags.integer({
+      description: 'Timeout in seconds for service operations',
+      default: 30,
     }),
   };
 
@@ -88,7 +102,9 @@ export default class Switch extends Command {
       this.showNextSteps();
     } catch (error) {
       logger.error('Failed to switch project', error);
-      this.error(error instanceof Error ? error.message : 'Unknown error occurred');
+      this.error(
+        `Failed to switch project: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
     }
   }
 
@@ -103,7 +119,8 @@ export default class Switch extends Command {
       this.log(chalk.red('📱 Services to stop:'));
       if (currentProject.services.length > 0) {
         currentProject.services.forEach(service => {
-          this.log(chalk.gray(`   • ${service.name}: ${service.command}`));
+          const command = this.getServiceCommand(service);
+          this.log(chalk.gray(`   • ${service.name}: ${command}`));
         });
       } else {
         this.log(chalk.gray('   (no services configured)'));
@@ -115,11 +132,9 @@ export default class Switch extends Command {
       this.log(chalk.green('🚀 Services to start:'));
       if (targetProject.services.length > 0) {
         targetProject.services.forEach(service => {
-          this.log(
-            chalk.gray(
-              `   • ${service.name}: ${service.command}${service.port ? ` (port ${service.port})` : ''}`
-            )
-          );
+          const command = this.getServiceCommand(service);
+          const portInfo = service.port ? ` (port ${service.port})` : '';
+          this.log(chalk.gray(`   • ${service.name}: ${command}${portInfo}`));
         });
       } else {
         this.log(chalk.gray('   (no services configured)'));
@@ -147,19 +162,23 @@ export default class Switch extends Command {
   ): Promise<void> {
     // Step 1: Stop current services
     if (currentProject && !flags['no-stop']) {
-      await this.stopCurrentServices(currentProject, flags.force);
+      await this.stopCurrentServices(currentProject, flags.force, flags.timeout);
     }
 
-    // Step 2: Update current project in config (no global env setting)
+    // Step 2: Update current project in config
     await this.configManager.setCurrentProject(targetProject.name);
 
-    // Step 3: Start new services with their environment
+    // Step 3: Start new services
     if (!flags['no-start']) {
-      await this.startProjectServices(targetProject);
+      await this.startProjectServices(targetProject, flags.timeout);
     }
   }
 
-  private async stopCurrentServices(currentProject: ProjectProfile, force: boolean): Promise<void> {
+  private async stopCurrentServices(
+    currentProject: ProjectProfile,
+    force: boolean,
+    timeoutSeconds: number = 30
+  ): Promise<void> {
     if (currentProject.services.length === 0) {
       this.log(chalk.gray('📱 No current services to stop\n'));
       return;
@@ -179,21 +198,28 @@ export default class Switch extends Command {
 
       const stopPromises = this.runningServices.map(async service => {
         try {
-          await this.stopService(service);
+          await this.stopService(service, timeoutSeconds);
           return { service: service.name, success: true };
         } catch (error) {
           logger.debug(`Failed to stop service ${service.name}`, error);
-          return { service: service.name, success: false, error };
+          return {
+            service: service.name,
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          };
         }
       });
 
-      const results = await Promise.all(stopPromises);
-      const failed = results.filter(r => !r.success);
+      const results = await Promise.allSettled(stopPromises);
+      const failed = results
+        .filter(r => r.status === 'fulfilled' && !r.value.success)
+        .map(r => (r.status === 'fulfilled' ? r.value : null))
+        .filter(Boolean);
 
       if (failed.length > 0 && !force) {
         spinner.fail(`📱 Failed to stop ${failed.length} service(s)`);
         failed.forEach(f => {
-          this.log(chalk.red(`   ✗ ${f.service}`));
+          if (f) this.log(chalk.red(`   ✗ ${f.service}: ${f.error}`));
         });
         throw new Error(`Failed to stop services. Use --force to continue anyway.`);
       } else if (failed.length > 0 && force) {
@@ -218,6 +244,17 @@ export default class Switch extends Command {
             name: service.name,
             pid,
             port: service.port,
+            ...(service.command && { command: service.command }),
+          });
+        }
+      } else if (service.command) {
+        // Try to find by command pattern
+        const pid = await this.findProcessByCommand(service.command);
+        if (pid) {
+          running.push({
+            name: service.name,
+            pid,
+            command: service.command,
           });
         }
       }
@@ -226,19 +263,64 @@ export default class Switch extends Command {
     return running;
   }
 
-  private async stopService(service: RunningService): Promise<void> {
+  private async findProcessByCommand(command: string): Promise<number | null> {
+    try {
+      const isWindows = process.platform === 'win32';
+      const { command: cmd } = ProcessUtils.parseCommand(command);
+
+      if (isWindows) {
+        const result = await ProcessUtils.execute('tasklist', ['/fo', 'csv']);
+        const lines = result.stdout.split('\n');
+
+        for (const line of lines) {
+          if (line.toLowerCase().includes(cmd.toLowerCase())) {
+            const match = line.match(/"(\d+)"/);
+            if (match) {
+              return parseInt(match[1], 10);
+            }
+          }
+        }
+      } else {
+        const result = await ProcessUtils.execute('pgrep', ['-f', cmd]);
+        if (result.exitCode === 0 && result.stdout.trim()) {
+          const pid = parseInt(result.stdout.trim().split('\n')[0], 10);
+          if (!isNaN(pid)) {
+            return pid;
+          }
+        }
+      }
+    } catch (error) {
+      logger.debug(`Failed to find process by command: ${command}`, error);
+    }
+
+    return null;
+  }
+
+  private async stopService(service: RunningService, timeoutSeconds: number): Promise<void> {
     try {
       // Try graceful shutdown first
       await ProcessUtils.killProcess(service.pid, 'SIGTERM');
 
-      // Wait a bit for graceful shutdown
-      await this.sleep(2000);
+      // Wait for graceful shutdown
+      const gracefulTimeout = Math.min(timeoutSeconds * 1000, 5000); // Max 5 seconds for graceful
+      const startTime = Date.now();
 
-      // Check if still running
+      while (Date.now() - startTime < gracefulTimeout) {
+        if (!ProcessUtils.isProcessRunning(service.pid)) {
+          logger.debug(`Service ${service.name} gracefully stopped`);
+          return;
+        }
+        await this.sleep(500);
+      }
+
+      // Force kill if still running
       if (ProcessUtils.isProcessRunning(service.pid)) {
-        // Force kill if still running
         await ProcessUtils.killProcess(service.pid, 'SIGKILL');
         await this.sleep(1000);
+
+        if (ProcessUtils.isProcessRunning(service.pid)) {
+          throw new Error(`Process ${service.pid} is still running after force kill`);
+        }
       }
 
       logger.debug(`Successfully stopped service ${service.name} (PID: ${service.pid})`);
@@ -249,39 +331,10 @@ export default class Switch extends Command {
     }
   }
 
-  private async setEnvironmentVariables(project: ProjectProfile): Promise<void> {
-    const envVars = Object.keys(project.environment);
-
-    if (envVars.length === 0) {
-      this.log(chalk.gray('🌍 No environment variables to set\n'));
-      return;
-    }
-
-    const spinner = ora(`🌍 Setting ${envVars.length} environment variable(s)...`).start();
-
-    try {
-      for (const [key, value] of Object.entries(project.environment)) {
-        ProcessUtils.setEnvironmentVariable(key, value);
-      }
-
-      spinner.succeed(`🌍 Set ${envVars.length} environment variable(s)`);
-
-      if (envVars.length <= 5) {
-        envVars.forEach(key => {
-          this.log(chalk.gray(`   • ${key}=${project.environment[key]}`));
-        });
-      } else {
-        this.log(
-          chalk.gray(`   • ${envVars.slice(0, 3).join(', ')} and ${envVars.length - 3} more...`)
-        );
-      }
-    } catch (error) {
-      spinner.fail('🌍 Failed to set environment variables');
-      throw error;
-    }
-  }
-
-  private async startProjectServices(project: ProjectProfile): Promise<void> {
+  private async startProjectServices(
+    project: ProjectProfile,
+    timeoutSeconds: number = 30
+  ): Promise<void> {
     if (project.services.length === 0) {
       this.log(chalk.gray('🚀 No services to start\n'));
       return;
@@ -290,6 +343,9 @@ export default class Switch extends Command {
     const spinner = ora(`🚀 Starting ${project.services.length} service(s)...`).start();
 
     try {
+      // Validate services before starting
+      this.validateServices(project.services);
+
       // Check for port conflicts
       await this.checkPortConflicts(project.services);
 
@@ -299,10 +355,8 @@ export default class Switch extends Command {
 
       spinner.text = `🚀 Starting ${project.services.length} service(s) in ${startupPlan.maxPhases} phases...`;
 
-      // Show dependency tree in verbose mode or if there are dependencies
-      const hasDependencies = project.services.some(
-        s => s.dependencies && s.dependencies.length > 0
-      );
+      // Show dependency tree if there are dependencies
+      const hasDependencies = project.services.some(s => s.dependencies?.length);
       if (hasDependencies) {
         spinner.stop();
         this.log(chalk.blue('📊 Dependency-aware startup:'));
@@ -315,22 +369,17 @@ export default class Switch extends Command {
       }
 
       // Start services phase by phase
-      const allResults: Array<{
-        service: string;
-        success: boolean;
-        error?: string;
-        phase: number;
-      }> = [];
+      const allResults: ServiceStartResult[] = [];
 
       for (let phaseIndex = 0; phaseIndex < startupPlan.phases.length; phaseIndex++) {
         const phase = startupPlan.phases[phaseIndex];
         spinner.text = `🚀 Starting Phase ${phaseIndex + 1}/${startupPlan.maxPhases}: ${phase.map(s => s.name).join(', ')}...`;
 
         // Start all services in current phase in parallel
-        const phaseResults = await Promise.all(
+        const phaseResults = await Promise.allSettled(
           phase.map(async service => {
             try {
-              await this.startService(service, project.path, project.environment);
+              await this.startService(service, project.path, project.environment, timeoutSeconds);
               return { service: service.name, success: true, phase: phaseIndex + 1 };
             } catch (error) {
               return {
@@ -343,7 +392,19 @@ export default class Switch extends Command {
           })
         );
 
-        allResults.push(...phaseResults);
+        // Process results
+        phaseResults.forEach(result => {
+          if (result.status === 'fulfilled') {
+            allResults.push(result.value);
+          } else {
+            allResults.push({
+              service: 'unknown',
+              success: false,
+              error: result.reason instanceof Error ? result.reason.message : 'Promise rejected',
+              phase: phaseIndex + 1,
+            });
+          }
+        });
 
         // Wait between phases for services to fully start
         if (phaseIndex < startupPlan.phases.length - 1) {
@@ -384,6 +445,33 @@ export default class Switch extends Command {
     }
   }
 
+  private validateServices(services: Service[]): void {
+    const errors: string[] = [];
+
+    for (const service of services) {
+      // Validate service has either command or template
+      if (!service.command && !service.template) {
+        errors.push(`Service '${service.name}' has no command or template defined`);
+      }
+
+      // Validate command if present
+      if (service.command && typeof service.command !== 'string') {
+        errors.push(`Service '${service.name}' has invalid command type`);
+      }
+
+      // Validate port if present
+      if (service.port !== undefined) {
+        if (!Number.isInteger(service.port) || service.port < 1 || service.port > 65535) {
+          errors.push(`Service '${service.name}' has invalid port: ${service.port}`);
+        }
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new Error(`Service validation failed:\n${errors.map(e => `  • ${e}`).join('\n')}`);
+    }
+  }
+
   private async checkPortConflicts(services: Service[]): Promise<void> {
     const conflicts: { service: string; port: number }[] = [];
 
@@ -397,18 +485,19 @@ export default class Switch extends Command {
     }
 
     if (conflicts.length > 0) {
-      throw new Error(
-        `Port conflicts detected: ${conflicts.map(c => `${c.service} (port ${c.port})`).join(', ')}`
-      );
+      const conflictList = conflicts.map(c => `${c.service} (port ${c.port})`).join(', ');
+      throw new Error(`Port conflicts detected: ${conflictList}`);
     }
   }
 
   private async startService(
     service: Service,
     workingDir: string,
-    projectEnvironment: Record<string, string> = {}
+    projectEnvironment: Record<string, string> = {},
+    timeoutSeconds: number = 30
   ): Promise<void> {
-    const { command, args } = ProcessUtils.parseCommand(service.command);
+    const command = this.getServiceCommand(service);
+    const { command: cmd, args } = ProcessUtils.parseCommand(command);
 
     // Combine project environment + service-specific environment
     const serviceEnv = {
@@ -417,18 +506,64 @@ export default class Switch extends Command {
       ...service.environment, // Service-specific environment (highest priority)
     };
 
-    const child = ProcessUtils.spawn(command, args, {
+    const child = ProcessUtils.spawn(cmd, args, {
       cwd: service.workingDirectory || workingDir,
       env: serviceEnv,
       detached: true,
       stdio: 'ignore',
     });
 
+    if (!child.pid) {
+      throw new Error(`Failed to start service ${service.name}: No PID returned`);
+    }
+
     // Detach the child process so it continues running
     child.unref();
 
-    logger.debug(`Started service ${service.name} with command: ${service.command}`);
+    // Wait for service to be ready
+    await this.waitForServiceReady(service, timeoutSeconds);
+
+    logger.debug(`Started service ${service.name} with command: ${command}`);
     logger.debug(`Environment variables: ${Object.keys(serviceEnv).join(', ')}`);
+  }
+
+  private getServiceCommand(service: Service): string {
+    if (service.command) {
+      return service.command;
+    }
+
+    if (service.template) {
+      // TODO: Generate command from service template
+      // This would integrate with your ServiceTemplateRegistry
+      throw new Error(
+        `Service template '${service.template}' not yet implemented for command generation`
+      );
+    }
+
+    throw new Error(`Service '${service.name}' has no command or template defined`);
+  }
+
+  private async waitForServiceReady(service: Service, timeoutSeconds: number): Promise<void> {
+    if (!service.port) {
+      // No port to check, assume ready after brief delay
+      await this.sleep(1000);
+      return;
+    }
+
+    const startTime = Date.now();
+    const timeoutMs = timeoutSeconds * 1000;
+
+    while (Date.now() - startTime < timeoutMs) {
+      const isPortReady = !(await ProcessUtils.isPortAvailable(service.port));
+      if (isPortReady) {
+        return; // Service is ready
+      }
+      await this.sleep(500);
+    }
+
+    throw new Error(
+      `Service ${service.name} did not become ready within ${timeoutSeconds} seconds`
+    );
   }
 
   private sleep(ms: number): Promise<void> {

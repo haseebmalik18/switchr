@@ -3,6 +3,7 @@ import {
   RuntimeVersion,
   RuntimeEnvironment,
   RuntimeInstallOptions,
+  VersionManagerInfo,
 } from '../../types/Runtime';
 import { logger } from '../../utils/Logger';
 

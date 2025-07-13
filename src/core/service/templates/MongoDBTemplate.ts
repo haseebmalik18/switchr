@@ -1,3 +1,7 @@
+// src/core/service/templates/MongoDBTemplate.ts - ENHANCED VERSION
+import { ServiceTemplateBase, ServiceTemplate, ServiceInstance } from '../ServiceTemplate';
+import { ProcessUtils } from '../../../utils/ProcessUtils';
+
 export class MongoDBTemplate extends ServiceTemplateBase {
   constructor() {
     const template: ServiceTemplate = {
@@ -32,6 +36,11 @@ export class MongoDBTemplate extends ServiceTemplateBase {
         password: {
           type: 'string',
           description: 'MongoDB password (optional)',
+        },
+        replicaSet: {
+          type: 'boolean',
+          default: false,
+          description: 'Enable replica set',
         },
       },
     };
@@ -71,15 +80,25 @@ export class MongoDBTemplate extends ServiceTemplateBase {
     try {
       await ProcessUtils.execute('docker', ['stop', instanceName]);
       await ProcessUtils.execute('docker', ['rm', instanceName]);
+
+      // Remove data volume
+      try {
+        await ProcessUtils.execute('docker', ['volume', 'rm', `${instanceName}-data`]);
+      } catch {
+        // Volume might not exist, ignore error
+      }
     } catch (error) {
       // Container might not exist, ignore error
     }
   }
 
   getCommand(config: Record<string, any>): string {
-    const { version, port, username, password, database } = config;
+    const { version, port, username, password, database, replicaSet } = config;
 
     let command = `docker run --name mongodb-${version} -d -p ${port}:27017`;
+
+    // Add data persistence
+    command += ` -v mongodb-${version}-data:/data/db`;
 
     if (username && password) {
       command += ` -e MONGO_INITDB_ROOT_USERNAME=${username}`;
@@ -88,6 +107,10 @@ export class MongoDBTemplate extends ServiceTemplateBase {
     }
 
     command += ` mongo:${version}`;
+
+    if (replicaSet) {
+      command += ` --replSet rs0`;
+    }
 
     return command;
   }

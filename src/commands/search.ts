@@ -1,37 +1,14 @@
-// src/commands/search.ts - Fixed implementation with proper types
+// src/commands/search.ts - Production-quality implementation
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../core/ConfigManager';
-import { PackageManager } from '../core/PackageManager';
+import { PackageManager, type SearchPackageOptions } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 import { logger } from '../utils/Logger';
-import { PackageType, RuntimeType } from '../types/Package';
-
-// Define search result interface
-interface SearchResult {
-  name: string;
-  type: PackageType;
-  version?: string;
-  description?: string;
-  category?: string;
-  runtime?: RuntimeType;
-  score?: number;
-  downloads?: number;
-  lastUpdated?: string;
-  repository?: string;
-  homepage?: string;
-}
-
-// Define search options interface
-interface SearchOptions {
-  type?: PackageType;
-  category?: string;
-  runtime?: RuntimeType;
-  limit: number;
-  sortBy: 'relevance' | 'downloads' | 'updated' | 'name';
-}
+import { PackageType, PackageSearchResult } from '../types/Package';
+import { RuntimeType } from '../types/Runtime';
 
 export default class Search extends Command {
   static override description = 'Search for available packages, runtimes, and services';
@@ -101,42 +78,21 @@ export default class Search extends Command {
     try {
       const spinner = ora(`Searching for: ${chalk.bold(args.query)}`).start();
 
-      // Initialize registries
-      await RuntimeRegistry.initialize();
-      await ServiceTemplateRegistry.initialize();
+      await this.initializeRegistries();
 
       const configManager = ConfigManager.getInstance();
-      const projectPath = process.cwd();
-
       const packageManager = new PackageManager({
-        projectPath,
+        projectPath: process.cwd(),
         cacheDir: configManager.getConfigDir(),
       });
 
-      // Build search options with proper typing
-      const searchOptions: SearchOptions = {
-        limit: flags.limit,
-        sortBy: flags['sort-by'] as 'relevance' | 'downloads' | 'updated' | 'name',
-      };
-
-      // Add optional properties only if they exist
-      if (flags.type) {
-        searchOptions.type = flags.type as PackageType;
-      }
-      if (flags.category) {
-        searchOptions.category = flags.category;
-      }
-      if (flags.runtime) {
-        searchOptions.runtime = flags.runtime as RuntimeType;
-      }
-
-      // Search for packages
+      const searchOptions = this.buildSearchOptions(flags);
       const results = await packageManager.searchPackages(args.query, searchOptions);
 
       spinner.stop();
 
       if (flags.json) {
-        this.outputJson(results, flags);
+        this.outputJson(results);
         return;
       }
 
@@ -147,13 +103,60 @@ export default class Search extends Command {
 
       await this.displayResults(results, flags);
     } catch (error) {
-      logger.error('Failed to search packages', error);
-      this.error(error instanceof Error ? error.message : 'Unknown error occurred');
+      logger.error('Search operation failed', error);
+      this.error(`Search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
-  private outputJson(results: SearchResult[], _flags: any): void {
-    const output = results.map(result => ({
+  private async initializeRegistries(): Promise<void> {
+    try {
+      await Promise.all([RuntimeRegistry.initialize(), ServiceTemplateRegistry.initialize()]);
+    } catch (error) {
+      logger.warn('Failed to initialize some registries', error);
+      // Continue with partial initialization
+    }
+  }
+
+  private buildSearchOptions(flags: any): SearchPackageOptions {
+    const options: SearchPackageOptions = {
+      limit: flags.limit,
+    };
+
+    // Handle sortBy with proper validation
+    const sortBy = flags['sort-by'];
+    if (sortBy && this.isValidSortBy(sortBy)) {
+      options.sortBy = sortBy;
+    }
+
+    if (flags.type && this.isValidPackageType(flags.type)) {
+      options.type = flags.type as PackageType;
+    }
+
+    if (flags.category) {
+      options.category = flags.category;
+    }
+
+    if (flags.runtime && this.isValidRuntimeType(flags.runtime)) {
+      options.runtime = flags.runtime as RuntimeType;
+    }
+
+    return options;
+  }
+
+  private isValidPackageType(type: string): type is PackageType {
+    return ['runtime', 'service', 'dependency', 'tool'].includes(type);
+  }
+
+  private isValidRuntimeType(type: string): type is RuntimeType {
+    return ['nodejs', 'python', 'go', 'java', 'rust', 'php', 'ruby', 'dotnet'].includes(type);
+  }
+
+  private isValidSortBy(sortBy: string): sortBy is NonNullable<SearchPackageOptions['sortBy']> {
+    return ['relevance', 'downloads', 'updated', 'name'].includes(sortBy);
+  }
+
+  private outputJson(results: PackageSearchResult[]): void {
+    const sanitized = results.map(result => ({
       name: result.name,
       type: result.type,
       version: result.version,
@@ -167,7 +170,7 @@ export default class Search extends Command {
       ...(result.homepage && { homepage: result.homepage }),
     }));
 
-    this.log(JSON.stringify(output, null, 2));
+    this.log(JSON.stringify(sanitized, null, 2));
   }
 
   private showNoResults(query: string, flags: any): void {
@@ -218,20 +221,11 @@ export default class Search extends Command {
     });
   }
 
-  private async displayResults(results: SearchResult[], flags: any): Promise<void> {
+  private async displayResults(results: PackageSearchResult[], flags: any): Promise<void> {
     this.log(chalk.green(`\n📦 Found ${results.length} package(s):\n`));
 
-    // Group by type for better organization
-    const grouped: Record<string, SearchResult[]> = {};
+    const grouped = this.groupByType(results);
 
-    for (const pkg of results) {
-      if (!grouped[pkg.type]) {
-        grouped[pkg.type] = [];
-      }
-      grouped[pkg.type].push(pkg);
-    }
-
-    // Display each type group
     for (const [type, packages] of Object.entries(grouped)) {
       if (packages.length === 0) continue;
 
@@ -247,14 +241,26 @@ export default class Search extends Command {
     this.showSearchFooter(results.length, flags);
   }
 
-  private async displayPackage(pkg: SearchResult, flags: any): Promise<void> {
+  private groupByType(results: PackageSearchResult[]): Record<string, PackageSearchResult[]> {
+    const grouped: Record<string, PackageSearchResult[]> = {};
+
+    for (const pkg of results) {
+      if (!grouped[pkg.type]) {
+        grouped[pkg.type] = [];
+      }
+      grouped[pkg.type].push(pkg);
+    }
+
+    return grouped;
+  }
+
+  private async displayPackage(pkg: PackageSearchResult, flags: any): Promise<void> {
     const nameColor = chalk.white;
     const versionInfo = pkg.version ? chalk.gray(`@${pkg.version}`) : '';
     const scoreInfo = pkg.score ? chalk.gray(` (${Math.round(pkg.score)}%)`) : '';
 
     let line = `  ${nameColor(pkg.name)}${versionInfo}${scoreInfo}`;
 
-    // Add installation status if requested
     if (flags['show-installed']) {
       const installed = await this.checkInstallationStatus(pkg);
       const statusIcon = installed ? chalk.green('✓') : chalk.gray('○');
@@ -263,19 +269,16 @@ export default class Search extends Command {
 
     this.log(line);
 
-    // Description
     if (pkg.description) {
       this.log(chalk.gray(`    ${pkg.description}`));
     }
 
-    // Show detailed information if requested
     if (flags.detailed) {
       await this.showDetailedInfo(pkg);
     }
   }
 
-  private async showDetailedInfo(pkg: SearchResult): Promise<void> {
-    // Category/Runtime info
+  private async showDetailedInfo(pkg: PackageSearchResult): Promise<void> {
     if (pkg.category && pkg.category !== pkg.type) {
       this.log(chalk.gray(`    Category: ${pkg.category}`));
     }
@@ -284,40 +287,14 @@ export default class Search extends Command {
       this.log(chalk.gray(`    Runtime: ${pkg.runtime}`));
     }
 
-    // Service-specific details
     if (pkg.type === 'service') {
-      const template = ServiceTemplateRegistry.getTemplate(pkg.name);
-      if (template) {
-        const templateInfo = template.getTemplate();
-
-        if (templateInfo.ports.length > 0) {
-          this.log(chalk.gray(`    Default ports: ${templateInfo.ports.join(', ')}`));
-        }
-
-        if (templateInfo.dependencies && templateInfo.dependencies.length > 0) {
-          this.log(chalk.gray(`    Dependencies: ${templateInfo.dependencies.join(', ')}`));
-        }
-      }
+      await this.showServiceDetails(pkg);
     }
 
-    // Runtime-specific details
     if (pkg.type === 'runtime') {
-      try {
-        if (RuntimeRegistry.isSupported(pkg.name)) {
-          const manager = RuntimeRegistry.create(pkg.name as RuntimeType, process.cwd(), '/tmp');
-          const availableManagers = await manager.getAvailableManagers();
-          const activeManager = availableManagers.find(m => m.available);
-
-          if (activeManager) {
-            this.log(chalk.gray(`    Version manager: ${activeManager.name}`));
-          }
-        }
-      } catch {
-        // Ignore errors in detailed info
-      }
+      await this.showRuntimeDetails(pkg);
     }
 
-    // Statistics
     if (pkg.downloads) {
       this.log(chalk.gray(`    Downloads: ${this.formatNumber(pkg.downloads)}`));
     }
@@ -327,7 +304,6 @@ export default class Search extends Command {
       this.log(chalk.gray(`    Last updated: ${this.formatDate(date)}`));
     }
 
-    // Links
     if (pkg.repository) {
       this.log(chalk.gray(`    Repository: ${pkg.repository}`));
     }
@@ -337,24 +313,78 @@ export default class Search extends Command {
     }
   }
 
-  private async checkInstallationStatus(pkg: SearchResult): Promise<boolean> {
+  private async showServiceDetails(pkg: PackageSearchResult): Promise<void> {
+    const template = ServiceTemplateRegistry.getTemplate(pkg.name);
+    if (!template) return;
+
+    const templateInfo = template.getTemplate();
+
+    if (templateInfo.ports.length > 0) {
+      this.log(chalk.gray(`    Default ports: ${templateInfo.ports.join(', ')}`));
+    }
+
+    if (templateInfo.dependencies?.length) {
+      this.log(chalk.gray(`    Dependencies: ${templateInfo.dependencies.join(', ')}`));
+    }
+  }
+
+  private async showRuntimeDetails(pkg: PackageSearchResult): Promise<void> {
+    if (!RuntimeRegistry.isSupported(pkg.name)) return;
+
+    try {
+      const manager = RuntimeRegistry.create(pkg.name as RuntimeType, process.cwd(), '/tmp');
+      const availableManagers = await manager.getAvailableManagers();
+      const activeManager = availableManagers.find(m => m.available);
+
+      if (activeManager) {
+        this.log(chalk.gray(`    Version manager: ${activeManager.name}`));
+      }
+    } catch (error) {
+      logger.debug('Failed to get runtime details', error);
+      // Don't show error to user for detailed info
+    }
+  }
+
+  private async checkInstallationStatus(pkg: PackageSearchResult): Promise<boolean> {
     try {
       switch (pkg.type) {
         case 'runtime':
-          if (RuntimeRegistry.isSupported(pkg.name)) {
-            const manager = RuntimeRegistry.create(pkg.name as RuntimeType, process.cwd(), '/tmp');
-            return await manager.isInstalled(pkg.version || 'latest');
-          }
-          return false;
-
+          return await this.isRuntimeInstalled(pkg);
         case 'service':
-          // Check if service template is available
           return ServiceTemplateRegistry.hasTemplate(pkg.name);
-
         case 'dependency':
-          // For dependencies, check if they exist in project files
           return await this.isDependencyInstalled(pkg);
+        default:
+          return false;
+      }
+    } catch (error) {
+      logger.debug(`Failed to check installation status for ${pkg.name}`, error);
+      return false;
+    }
+  }
 
+  private async isRuntimeInstalled(pkg: PackageSearchResult): Promise<boolean> {
+    if (!RuntimeRegistry.isSupported(pkg.name)) return false;
+
+    try {
+      const manager = RuntimeRegistry.create(pkg.name as RuntimeType, process.cwd(), '/tmp');
+      return await manager.isInstalled(pkg.version || 'latest');
+    } catch {
+      return false;
+    }
+  }
+
+  private async isDependencyInstalled(pkg: PackageSearchResult): Promise<boolean> {
+    const { FileSystem } = await import('../utils/FileSystem');
+
+    try {
+      switch (pkg.runtime) {
+        case 'nodejs':
+          return await this.isNodePackageInstalled(pkg.name);
+        case 'python':
+          return await this.isPythonPackageInstalled(pkg.name);
+        case 'go':
+          return await this.isGoPackageInstalled(pkg.name);
         default:
           return false;
       }
@@ -363,45 +393,36 @@ export default class Search extends Command {
     }
   }
 
-  private async isDependencyInstalled(pkg: SearchResult): Promise<boolean> {
+  private async isNodePackageInstalled(packageName: string): Promise<boolean> {
+    const { FileSystem } = await import('../utils/FileSystem');
+    const packageJsonPath = `${process.cwd()}/package.json`;
+
+    const packageJson = await FileSystem.readJsonFile(packageJsonPath);
+    if (!packageJson) return false;
+
+    return !!(
+      packageJson.dependencies?.[packageName] || packageJson.devDependencies?.[packageName]
+    );
+  }
+
+  private async isPythonPackageInstalled(packageName: string): Promise<boolean> {
     const fs = await import('fs-extra');
-    const path = await import('path');
+    const requirementsPath = `${process.cwd()}/requirements.txt`;
 
-    try {
-      switch (pkg.runtime) {
-        case 'nodejs':
-          const packageJsonPath = path.join(process.cwd(), 'package.json');
-          if (await fs.pathExists(packageJsonPath)) {
-            const packageJson = await fs.readJson(packageJsonPath);
-            return !!(
-              packageJson.dependencies?.[pkg.name] || packageJson.devDependencies?.[pkg.name]
-            );
-          }
-          return false;
+    if (!(await fs.pathExists(requirementsPath))) return false;
 
-        case 'python':
-          // Check requirements.txt or installed packages
-          const requirementsPath = path.join(process.cwd(), 'requirements.txt');
-          if (await fs.pathExists(requirementsPath)) {
-            const content = await fs.readFile(requirementsPath, 'utf8');
-            return content.includes(pkg.name);
-          }
-          return false;
+    const content = await fs.readFile(requirementsPath, 'utf8');
+    return content.includes(packageName);
+  }
 
-        case 'go':
-          const goModPath = path.join(process.cwd(), 'go.mod');
-          if (await fs.pathExists(goModPath)) {
-            const content = await fs.readFile(goModPath, 'utf8');
-            return content.includes(pkg.name);
-          }
-          return false;
+  private async isGoPackageInstalled(packageName: string): Promise<boolean> {
+    const fs = await import('fs-extra');
+    const goModPath = `${process.cwd()}/go.mod`;
 
-        default:
-          return false;
-      }
-    } catch {
-      return false;
-    }
+    if (!(await fs.pathExists(goModPath))) return false;
+
+    const content = await fs.readFile(goModPath, 'utf8');
+    return content.includes(packageName);
   }
 
   private showSearchFooter(resultCount: number, flags: any): void {
@@ -430,10 +451,10 @@ export default class Search extends Command {
   }
 
   private formatNumber(num: number): string {
-    if (num >= 1000000) {
-      return `${(num / 1000000).toFixed(1)}M`;
-    } else if (num >= 1000) {
-      return `${(num / 1000).toFixed(1)}K`;
+    if (num >= 1_000_000) {
+      return `${(num / 1_000_000).toFixed(1)}M`;
+    } else if (num >= 1_000) {
+      return `${(num / 1_000).toFixed(1)}K`;
     }
     return num.toString();
   }
