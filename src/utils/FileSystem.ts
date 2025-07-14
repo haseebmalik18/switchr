@@ -149,7 +149,15 @@ export class FileSystem {
   }
 
   static normalizePath(inputPath: string): string {
-    return path.resolve(path.normalize(inputPath));
+    // Convert backslashes to forward slashes and normalize
+    const normalized = path.normalize(inputPath.replace(/\\/g, '/'));
+
+    // If the path is already relative, keep it relative
+    if (!path.isAbsolute(inputPath)) {
+      return normalized;
+    }
+
+    return path.resolve(normalized);
   }
 
   static getRelativePath(from: string, to: string): string {

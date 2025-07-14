@@ -290,20 +290,20 @@ export class PackageManager {
    * Remove a package from the project
    */
   async removePackage(packageName: string, options: RemovePackageOptions = {}): Promise<boolean> {
-    logger.info(`Removing package: ${packageName}`);
-
     try {
       await this.ensureRegistriesInitialized();
 
       const projectConfig = await this.configManager.loadProjectConfig(this.projectPath);
       if (!projectConfig?.packages) {
-        throw new Error('No packages found in project configuration');
+        logger.debug(`No packages found in project configuration for ${packageName}`);
+        return false;
       }
 
       // Find package in configuration
       const packageDef = await this.findPackageInConfig(packageName, projectConfig.packages);
       if (!packageDef) {
-        throw new Error(`Package not found: ${packageName}`);
+        logger.debug(`Package not found in configuration: ${packageName}`);
+        return false;
       }
 
       // Check for dependents unless forced

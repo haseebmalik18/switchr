@@ -67,6 +67,9 @@ export class LockFileManager {
 
   async write(lockFile: LockFile): Promise<void> {
     try {
+      // Ensure the directory exists
+      await fs.ensureDir(this.projectPath);
+
       // Ensure lock file has correct version and metadata
       const completeFile: LockFile = {
         ...lockFile,

@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as yaml from 'yaml';
 import { GlobalConfig, ProjectConfigFile } from '../types/Config';
 import { ProjectProfile, IDEConfig, Service } from '../types/Project';
+import { logger } from '../utils/Logger';
 
 export class ConfigManager {
   private static instance: ConfigManager;
@@ -175,9 +176,11 @@ export class ConfigManager {
 
       return this.projectConfigToProfile(configFile, projectPath);
     } catch (error) {
-      throw new Error(
+      // Log the error but return null for corrupted files
+      logger.warn(
         `Failed to load project config at ${configPath}: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
+      return null;
     }
   }
 
@@ -186,6 +189,9 @@ export class ConfigManager {
     const configFile = this.projectProfileToConfig(profile);
 
     try {
+      // Ensure the directory exists
+      await fs.ensureDir(projectPath);
+
       const content = yaml.stringify(configFile, {
         indent: 2,
         lineWidth: 100,

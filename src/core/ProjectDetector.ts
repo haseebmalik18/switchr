@@ -70,7 +70,9 @@ export class ProjectDetector {
       const matchingFiles = indicator.files.filter(file => projectFiles.includes(file));
 
       if (matchingFiles.length > 0) {
-        const confidence = indicator.confidence * (matchingFiles.length / indicator.files.length);
+        // Use full confidence if any indicator file is found
+        // Bonus for having multiple indicator files
+        const confidence = indicator.confidence + (matchingFiles.length - 1) * 0.05;
 
         if (confidence > bestMatch.confidence) {
           bestMatch = { type: indicator.type, confidence };
@@ -197,6 +199,36 @@ export class ProjectDetector {
         });
       }
 
+      // Suggest database services for web projects
+      if (
+        dependencies.express ||
+        dependencies.fastify ||
+        dependencies.react ||
+        dependencies.next ||
+        dependencies.vue
+      ) {
+        services.push({
+          name: 'postgresql',
+          template: 'postgresql',
+          version: '15',
+          port: 5432,
+          autoRestart: true,
+          environment: {
+            POSTGRES_DB: 'app_db',
+            POSTGRES_USER: 'app_user',
+            POSTGRES_PASSWORD: 'app_password',
+          },
+        });
+
+        services.push({
+          name: 'redis',
+          template: 'redis',
+          version: '7',
+          port: 6379,
+          autoRestart: true,
+        });
+      }
+
       return services;
     } catch (error) {
       logger.warn('Failed to suggest Node.js services', error);
@@ -240,6 +272,34 @@ export class ProjectDetector {
             port: 8000,
             autoRestart: true,
             workingDirectory: projectPath,
+          });
+        }
+
+        // Suggest database services for web frameworks
+        if (
+          requirements.includes('django') ||
+          requirements.includes('flask') ||
+          requirements.includes('fastapi')
+        ) {
+          services.push({
+            name: 'postgresql',
+            template: 'postgresql',
+            version: '15',
+            port: 5432,
+            autoRestart: true,
+            environment: {
+              POSTGRES_DB: 'app_db',
+              POSTGRES_USER: 'app_user',
+              POSTGRES_PASSWORD: 'app_password',
+            },
+          });
+
+          services.push({
+            name: 'redis',
+            template: 'redis',
+            version: '7',
+            port: 6379,
+            autoRestart: true,
           });
         }
       }
@@ -334,7 +394,7 @@ export class ProjectDetector {
 
     switch (detectedType.type) {
       case 'node':
-        tools.node = await this.detectNodeVersion(projectPath);
+        tools.nodejs = await this.detectNodeVersion(projectPath);
         tools.npm = await this.detectNpmVersion();
         break;
       case 'python':
