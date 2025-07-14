@@ -5,7 +5,17 @@ import * as path from 'path';
 import { ProjectDetector } from '../core/ProjectDetector';
 import { ConfigManager } from '../core/ConfigManager';
 import { FileSystem } from '../utils/FileSystem';
-import { ProjectProfile, Service } from '../types/Project';
+import { ProjectProfile, Service, ProjectDetectionResult, ProjectType } from '../types/Project';
+
+interface InteractiveSetupResponses {
+  projectName: string;
+  description?: string;
+  projectType?: ProjectType;
+  useDetectedServices?: boolean;
+  useDetectedEnv?: boolean;
+  addCustomServices?: boolean;
+  customServices?: Service[];
+}
 
 export default class Init extends Command {
   static override description = 'Initialize a new project profile for switchr';
@@ -116,14 +126,14 @@ export default class Init extends Command {
 
   private async runInteractiveSetup(
     suggestedName: string | undefined,
-    detectionResult: any,
+    detectionResult: ProjectDetectionResult | undefined,
     projectPath: string
   ) {
     const questions = [];
 
     const defaultName =
-      suggestedName || detectionResult?.type !== 'generic'
-        ? `${detectionResult.type}-${path.basename(projectPath)}`
+      suggestedName || (detectionResult && detectionResult.type !== 'generic')
+        ? `${detectionResult?.type}-${path.basename(projectPath)}`
         : path.basename(projectPath);
 
     questions.push({
@@ -268,9 +278,9 @@ export default class Init extends Command {
   }
 
   private async createProjectProfile(
-    responses: any,
+    responses: InteractiveSetupResponses,
     projectPath: string,
-    detectionResult: any
+    detectionResult: ProjectDetectionResult | undefined
   ): Promise<ProjectProfile> {
     const services: Service[] = [];
 
@@ -291,7 +301,7 @@ export default class Init extends Command {
       name: responses.projectName,
       path: projectPath,
       type: responses.projectType || detectionResult?.type || 'generic',
-      description: responses.description || undefined,
+      ...(responses.description && { description: responses.description }),
       environment,
       services,
       tools: detectionResult?.suggestedTools || {},
@@ -303,7 +313,7 @@ export default class Init extends Command {
   private async createDefaultProfile(
     projectName: string,
     projectPath: string,
-    detectionResult: any
+    detectionResult: ProjectDetectionResult | undefined
   ): Promise<ProjectProfile> {
     const name = projectName;
 

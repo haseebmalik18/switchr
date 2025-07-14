@@ -13,40 +13,23 @@ interface PyPIPackageResponse {
     author_email?: string;
     maintainer?: string;
     maintainer_email?: string;
-    license?: string;
     home_page?: string;
     download_url?: string;
     project_urls?: Record<string, string>;
     classifiers?: string[];
     requires_dist?: string[];
     requires_python?: string;
+    license?: string;
   };
-  releases: Record<
-    string,
-    Array<{
-      filename: string;
-      packagetype: string;
-      python_version: string;
-      size: number;
-      upload_time: string;
-      url: string;
-      digests: {
-        md5: string;
-        sha256: string;
-      };
-    }>
-  >;
+  releases: Record<string, any[]>;
   urls: Array<{
     filename: string;
-    packagetype: string;
-    python_version: string;
-    size: number;
-    upload_time: string;
     url: string;
     digests: {
       md5: string;
       sha256: string;
     };
+    upload_time: string;
   }>;
 }
 
@@ -58,19 +41,6 @@ interface PyPIStatsResponse {
   };
   package: string;
   type: string;
-}
-
-interface PyPISimpleResponse {
-  files: Array<{
-    filename: string;
-    url: string;
-    hashes?: Record<string, string>;
-  }>;
-  meta: {
-    'api-version': string;
-  };
-  name: string;
-  versions: string[];
 }
 
 export class PyPIRegistry {
@@ -201,7 +171,7 @@ export class PyPIRegistry {
         throw new Error(`PyPI package info failed: ${response.status} ${response.statusText}`);
       }
 
-      const data: PyPIPackageResponse = await response.json();
+      const data = (await response.json()) as PyPIPackageResponse;
       this.requestCount++;
 
       return this.transformPackageInfo(data, version);
@@ -226,7 +196,7 @@ export class PyPIRegistry {
 
       if (!response.ok) return [];
 
-      const data: PyPIPackageResponse = await response.json();
+      const data = (await response.json()) as PyPIPackageResponse;
       this.requestCount++;
 
       return Object.keys(data.releases).sort((a, b) => {
@@ -271,7 +241,7 @@ export class PyPIRegistry {
         throw new Error(`PyPI download stats failed: ${response.status} ${response.statusText}`);
       }
 
-      const data: PyPIStatsResponse = await response.json();
+      const data = (await response.json()) as PyPIStatsResponse;
       this.requestCount++;
 
       return data.data?.last_month || 0;
@@ -408,12 +378,14 @@ export class PyPIRegistry {
     if (info.keywords) {
       result.keywords = info.keywords
         .split(',')
-        .map(k => k.trim())
-        .filter(k => k);
+        .map((k: string) => k.trim())
+        .filter((k: string) => k);
     }
 
-    if (info.project_urls?.['Homepage'] || info.home_page) {
-      result.homepage = info.project_urls?.['Homepage'] || info.home_page;
+    if (info.project_urls?.['Homepage']) {
+      result.homepage = info.project_urls['Homepage'];
+    } else if (info.home_page) {
+      result.homepage = info.home_page;
     }
 
     if (info.project_urls?.['Repository'] || info.project_urls?.['Source']) {

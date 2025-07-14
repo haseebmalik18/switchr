@@ -33,7 +33,7 @@ export interface RuntimePackage extends PackageDefinition {
 export interface ServicePackage extends PackageDefinition {
   type: 'service';
   template: string;
-  config?: Record<string, any>;
+  config?: Record<string, unknown>;
   healthCheck?: string;
   dependencies?: string[];
   ports?: number[];
@@ -92,7 +92,7 @@ export interface LockFile {
     {
       template: string;
       version: string;
-      config: Record<string, any>;
+      config: Record<string, unknown>;
       image?: string;
       digest?: string;
       ports?: number[];
@@ -113,13 +113,18 @@ export function isDependencyPackage(pkg: PackageDefinition): pkg is DependencyPa
   return pkg.type === 'dependency';
 }
 
-export function isPackageSearchResult(obj: any): obj is PackageSearchResult {
+export function isPackageSearchResult(obj: unknown): obj is PackageSearchResult {
   return (
-    obj &&
+    obj !== null &&
+    obj !== undefined &&
     typeof obj === 'object' &&
-    typeof obj.name === 'string' &&
-    typeof obj.type === 'string' &&
-    ['runtime', 'dependency', 'service', 'tool'].includes(obj.type)
+    'name' in obj &&
+    'type' in obj &&
+    typeof (obj as Record<string, unknown>).name === 'string' &&
+    typeof (obj as Record<string, unknown>).type === 'string' &&
+    ['runtime', 'dependency', 'service', 'tool'].includes(
+      (obj as Record<string, unknown>).type as string
+    )
   );
 }
 
@@ -200,8 +205,16 @@ export interface RegistryConfig {
   };
 }
 
+export interface PackageSearchOptions {
+  limit?: number;
+  offset?: number;
+  type?: PackageType;
+  runtime?: string;
+  includePrerelease?: boolean;
+}
+
 export interface PackageRegistry {
-  search(query: string, options?: any): Promise<PackageSearchResult[]>;
+  search(query: string, options?: PackageSearchOptions): Promise<PackageSearchResult[]>;
   getPackageInfo(name: string, version?: string): Promise<PackageDefinition | null>;
   getVersions(name: string): Promise<string[]>;
   getLatestVersion(name: string): Promise<string | null>;

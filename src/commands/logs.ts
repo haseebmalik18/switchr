@@ -21,8 +21,19 @@ interface ServiceLogInfo {
   running: boolean;
 }
 
+interface LogsCommandFlags {
+  follow: boolean;
+  tail: number;
+  since: string | undefined;
+  level: string | undefined;
+  json: boolean;
+  timestamps: boolean;
+  raw: boolean;
+  grep: string | undefined;
+}
+
 export default class Logs extends Command {
-  static override description = 'View logs from project services';
+  static override description = 'View logs for project services';
 
   static override examples = [
     '<%= config.bin %> <%= command.id %>',
@@ -77,11 +88,16 @@ export default class Logs extends Command {
     }),
   };
 
-  private followMode = false;
   private shouldStop = false;
+  private parsedArgs: { service?: string } = {};
+  // TODO: Will be needed for different follow modes (tail, watch, etc.)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  // @ts-expect-error - Property reserved for future use
+  private _followMode: 'tail' | 'watch' | 'live' = 'tail';
 
   public async run(): Promise<void> {
     const { args, flags } = await this.parse(Logs);
+    this.parsedArgs = { ...(args.service && { service: args.service }) };
 
     try {
       const configManager = ConfigManager.getInstance();
@@ -107,7 +123,6 @@ export default class Logs extends Command {
       const serviceLogInfo = await this.getServiceLogInfo(servicesToShow);
 
       if (flags.follow) {
-        this.followMode = true;
         this.setupSignalHandlers();
         await this.followLogs(serviceLogInfo, flags);
       } else {
@@ -156,7 +171,10 @@ export default class Logs extends Command {
       }
 
       // Look for log files in common locations
-      info.logFile = await this.findLogFile(service);
+      const logFile = await this.findLogFile(service);
+      if (logFile) {
+        info.logFile = logFile;
+      }
 
       serviceLogInfo.push(info);
     }
@@ -165,8 +183,6 @@ export default class Logs extends Command {
   }
 
   private async findLogFile(service: Service): Promise<string | undefined> {
-    const { FileSystem } = await import('../utils/FileSystem');
-
     const possibleLogLocations = [
       `logs/${service.name}.log`,
       `${service.name}.log`,
@@ -190,7 +206,7 @@ export default class Logs extends Command {
     return undefined;
   }
 
-  private async showLogs(serviceLogInfo: ServiceLogInfo[], flags: any): Promise<void> {
+  private async showLogs(serviceLogInfo: ServiceLogInfo[], flags: LogsCommandFlags): Promise<void> {
     if (flags.json) {
       await this.showLogsJson(serviceLogInfo, flags);
       return;
@@ -203,11 +219,12 @@ export default class Logs extends Command {
 
     // Show header
     if (!flags.raw) {
-      this.log(chalk.blue(`📋 Service Logs${flags.since ? ` (since ${flags.since})` : ''}\n`));
+      const sinceText = flags.since ? ` (since ${flags.since})` : '';
+      this.log(chalk.blue(`📋 Service Logs${sinceText}\n`));
     }
 
     for (const serviceInfo of serviceLogInfo) {
-      await this.showServiceLogs(serviceInfo, flags);
+      await this.showServiceLogs(serviceInfo, flags, serviceLogInfo);
     }
 
     if (!flags.raw && serviceLogInfo.length > 1) {
@@ -220,7 +237,11 @@ export default class Logs extends Command {
     }
   }
 
-  private async showServiceLogs(serviceInfo: ServiceLogInfo, flags: any): Promise<void> {
+  private async showServiceLogs(
+    serviceInfo: ServiceLogInfo,
+    flags: LogsCommandFlags,
+    allServiceInfo: ServiceLogInfo[]
+  ): Promise<void> {
     if (!flags.raw) {
       const statusIcon = serviceInfo.running ? chalk.green('●') : chalk.red('●');
       const pidInfo = serviceInfo.pid ? chalk.gray(` (PID: ${serviceInfo.pid})`) : '';
@@ -259,7 +280,7 @@ export default class Logs extends Command {
         this.displayLogLine(log, serviceInfo.name, flags);
       }
 
-      if (!flags.raw && serviceInfo !== serviceLogInfo[serviceLogInfo.length - 1]) {
+      if (!flags.raw && serviceInfo !== allServiceInfo[allServiceInfo.length - 1]) {
         this.log(''); // Add spacing between services
       }
     } catch (error) {
@@ -273,7 +294,7 @@ export default class Logs extends Command {
     }
   }
 
-  private async readLogFile(logFile: string, flags: any): Promise<string[]> {
+  private async readLogFile(logFile: string, flags: LogsCommandFlags): Promise<string[]> {
     const fs = await import('fs-extra');
 
     try {
@@ -291,7 +312,7 @@ export default class Logs extends Command {
     }
   }
 
-  private async getProcessLogs(pid: number, flags: any): Promise<string[]> {
+  private async getProcessLogs(pid: number, flags: LogsCommandFlags): Promise<string[]> {
     try {
       // Try to get logs from journalctl on Linux
       if (process.platform === 'linux') {
@@ -313,7 +334,7 @@ export default class Logs extends Command {
     }
   }
 
-  private async getDockerLogs(serviceName: string, flags: any): Promise<string[]> {
+  private async getDockerLogs(serviceName: string, flags: LogsCommandFlags): Promise<string[]> {
     try {
       const args = ['logs'];
 
@@ -335,7 +356,7 @@ export default class Logs extends Command {
     }
   }
 
-  private applyFilters(logs: string[], flags: any): string[] {
+  private applyFilters(logs: string[], flags: LogsCommandFlags): string[] {
     let filteredLogs = logs;
 
     // Filter by log level
@@ -353,7 +374,7 @@ export default class Logs extends Command {
     return filteredLogs;
   }
 
-  private displayLogLine(log: string, serviceName: string, flags: any): void {
+  private displayLogLine(log: string, serviceName: string, flags: LogsCommandFlags): void {
     if (flags.raw) {
       this.log(log);
       return;
@@ -370,7 +391,7 @@ export default class Logs extends Command {
     }
 
     // Add service name for multi-service logs
-    if (flags.service === undefined) {
+    if (!this.parsedArgs.service) {
       // Show service name when viewing all services
       output += chalk.cyan(`[${serviceName}] `);
     }
@@ -390,7 +411,9 @@ export default class Logs extends Command {
     return {
       timestamp: timestampMatch ? new Date(timestampMatch[1]) : new Date(),
       service: '',
-      level: levelMatch ? (levelMatch[1].toLowerCase() as any) : 'info',
+      level: levelMatch
+        ? (levelMatch[1].toLowerCase() as 'debug' | 'info' | 'warn' | 'error')
+        : 'info',
       message: log,
     };
   }
@@ -411,7 +434,10 @@ export default class Logs extends Command {
     }
   }
 
-  private async followLogs(serviceLogInfo: ServiceLogInfo[], flags: any): Promise<void> {
+  private async followLogs(
+    serviceLogInfo: ServiceLogInfo[],
+    flags: LogsCommandFlags
+  ): Promise<void> {
     this.log(chalk.blue('📋 Following logs... (Press Ctrl+C to stop)\n'));
 
     // Start following logs for each service
@@ -433,7 +459,7 @@ export default class Logs extends Command {
     await Promise.race([Promise.all(followPromises), this.waitForStop()]);
   }
 
-  private async followLogFile(serviceInfo: ServiceLogInfo, flags: any): Promise<void> {
+  private async followLogFile(serviceInfo: ServiceLogInfo, flags: LogsCommandFlags): Promise<void> {
     if (!serviceInfo.logFile) return;
 
     try {
@@ -447,7 +473,7 @@ export default class Logs extends Command {
       args.push(serviceInfo.logFile);
 
       const child = ProcessUtils.spawn('tail', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: 'pipe',
       });
 
       if (child.stdout) {
@@ -486,7 +512,10 @@ export default class Logs extends Command {
     }
   }
 
-  private async followDockerLogs(serviceInfo: ServiceLogInfo, flags: any): Promise<void> {
+  private async followDockerLogs(
+    serviceInfo: ServiceLogInfo,
+    flags: LogsCommandFlags
+  ): Promise<void> {
     try {
       const args = ['logs', '-f'];
 
@@ -497,7 +526,7 @@ export default class Logs extends Command {
       args.push(serviceInfo.name);
 
       const child = ProcessUtils.spawn('docker', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: 'pipe',
       });
 
       if (child.stdout) {
@@ -608,8 +637,18 @@ export default class Logs extends Command {
     }
   }
 
-  private async showLogsJson(serviceLogInfo: ServiceLogInfo[], flags: any): Promise<void> {
-    const logsData: any[] = [];
+  private async showLogsJson(
+    serviceLogInfo: ServiceLogInfo[],
+    flags: LogsCommandFlags
+  ): Promise<void> {
+    const logsData: Array<{
+      service: string;
+      timestamp?: string;
+      level?: string;
+      message?: string;
+      pid?: number;
+      error?: string;
+    }> = [];
 
     for (const serviceInfo of serviceLogInfo) {
       try {
@@ -636,7 +675,7 @@ export default class Logs extends Command {
             timestamp: parsed.timestamp.toISOString(),
             level: parsed.level,
             message: parsed.message,
-            pid: serviceInfo.pid,
+            ...(serviceInfo.pid !== undefined && { pid: serviceInfo.pid }),
           });
         }
       } catch (error) {

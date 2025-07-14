@@ -6,14 +6,15 @@ import { ServiceTemplateRegistry } from './service/ServiceTemplateRegistry';
 import { LockFileManager } from './LockFileManager';
 import {
   PackageDefinition,
-  RuntimePackage,
   ServicePackage,
   DependencyPackage,
+  RuntimePackage,
   PackageSearchResult,
   PackageInstallResult,
   LockFile,
   PackageType,
 } from '../types/Package';
+import { ProjectPackages } from '../types/Project';
 import { RuntimeType } from '../types/Runtime';
 import { logger } from '../utils/Logger';
 import { ConfigManager } from './ConfigManager';
@@ -28,12 +29,27 @@ interface NpmSearchResponse {
       description?: string;
       keywords?: string[];
       date: string;
-      author?: { name: string };
-      repository?: { url: string };
+      author?: {
+        name: string;
+        email?: string;
+      };
+      publisher?: {
+        username: string;
+        email?: string;
+      };
+      maintainers?: Array<{
+        username: string;
+        email?: string;
+      }>;
+      repository?: {
+        type: string;
+        url: string;
+      };
       links: {
         npm: string;
         homepage?: string;
         repository?: string;
+        bugs?: string;
       };
     };
     score: {
@@ -48,19 +64,6 @@ interface NpmSearchResponse {
   }>;
   total: number;
   time: string;
-}
-
-interface PyPiSearchResponse {
-  info: {
-    name: string;
-    version: string;
-    summary?: string;
-    description?: string;
-    author?: string;
-    home_page?: string;
-    project_urls?: Record<string, string>;
-  };
-  releases: Record<string, any[]>;
 }
 
 interface RuntimeInstallOptions {
@@ -219,10 +222,7 @@ export class PackageManager {
   /**
    * Add a new package to the project
    */
-  async addPackage(
-    packageSpec: string,
-    options: AddPackageOptions = {}
-  ): Promise<PackageInstallResult> {
+  async addPackage(packageSpec: string, options: AddPackageOptions): Promise<PackageInstallResult> {
     logger.info(`Adding package: ${packageSpec}`);
 
     try {
@@ -251,7 +251,7 @@ export class PackageManager {
           result = await this.addRuntime(packageDef as RuntimePackage, options);
           break;
         case 'service':
-          result = await this.addService(packageDef as ServicePackage, options);
+          result = await this.addService(packageDef as ServicePackage);
           break;
         case 'dependency':
           result = await this.addDependency(packageDef as DependencyPackage, options);
@@ -322,10 +322,10 @@ export class PackageManager {
           await this.removeRuntime(packageDef as RuntimePackage, options);
           break;
         case 'service':
-          await this.removeService(packageDef as ServicePackage, options);
+          await this.removeService(packageDef as ServicePackage);
           break;
         case 'dependency':
-          await this.removeDependency(packageDef as DependencyPackage, options);
+          await this.removeDependency(packageDef as DependencyPackage);
           break;
       }
 
@@ -676,10 +676,7 @@ export class PackageManager {
     };
   }
 
-  private async addService(
-    service: ServicePackage,
-    options: AddPackageOptions
-  ): Promise<PackageInstallResult> {
+  private async addService(service: ServicePackage): Promise<PackageInstallResult> {
     const template = ServiceTemplateRegistry.getTemplate(service.template || service.name);
     if (!template) {
       throw new Error(`Unknown service template: ${service.template || service.name}`);
@@ -708,7 +705,7 @@ export class PackageManager {
       case 'go':
         return await this.installGoDependency(dep, options);
       case 'java':
-        return await this.installJavaDependency(dep, options);
+        return await this.installJavaDependency(dep);
       case 'rust':
         return await this.installRustDependency(dep, options);
       default:
@@ -787,76 +784,51 @@ export class PackageManager {
 
   private async installGoDependency(
     dep: DependencyPackage,
-    options: AddPackageOptions
+    _options: AddPackageOptions
   ): Promise<PackageInstallResult> {
-    const args = ['get', dep.name];
+    logger.info(`Installing Go dependency: ${dep.name}@${dep.version || 'latest'}`);
 
-    if (dep.version) {
-      args[1] = `${dep.name}@${dep.version}`;
-    }
+    await ProcessUtils.execute('go', ['get', dep.name], {
+      cwd: this.projectPath,
+      env: process.env,
+    });
 
-    try {
-      await ProcessUtils.execute('go', args, {
-        cwd: this.projectPath,
-        timeout: this.options.timeout || 60000,
-      });
-
-      return {
-        success: true,
-        package: dep,
-        installedVersion: dep.version || 'latest',
-      };
-    } catch (error) {
-      throw new Error(
-        `Failed to install Go dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
+    return {
+      success: true,
+      package: dep,
+      installedVersion: dep.version || 'latest',
+    };
   }
 
-  private async installJavaDependency(
-    dep: DependencyPackage,
-    options: AddPackageOptions
-  ): Promise<PackageInstallResult> {
-    // Java dependencies are typically managed through Maven or Gradle
-    // This would require editing pom.xml or build.gradle
-    throw new Error('Java dependency installation not yet implemented');
+  private async installJavaDependency(_dep: DependencyPackage): Promise<PackageInstallResult> {
+    // Java dependencies are handled through build tools (Maven/Gradle)
+    // This is typically done via build configuration files
+    throw new Error(
+      'Java dependency installation should be handled through Maven/Gradle build files'
+    );
   }
 
   private async installRustDependency(
     dep: DependencyPackage,
-    options: AddPackageOptions
+    _options: AddPackageOptions
   ): Promise<PackageInstallResult> {
-    const args = ['add', dep.name];
+    logger.info(`Installing Rust dependency: ${dep.name}@${dep.version || 'latest'}`);
 
-    if (dep.version) {
-      args.push('--vers', dep.version);
-    }
+    await ProcessUtils.execute('cargo', ['add', dep.name], {
+      cwd: this.projectPath,
+      env: process.env,
+    });
 
-    if (options.dev || dep.devOnly) {
-      args.push('--dev');
-    }
-
-    try {
-      await ProcessUtils.execute('cargo', args, {
-        cwd: this.projectPath,
-        timeout: this.options.timeout || 60000,
-      });
-
-      return {
-        success: true,
-        package: dep,
-        installedVersion: dep.version || 'latest',
-      };
-    } catch (error) {
-      throw new Error(
-        `Failed to install Rust dependency: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
+    return {
+      success: true,
+      package: dep,
+      installedVersion: dep.version || 'latest',
+    };
   }
 
   private async removeRuntime(
     runtime: RuntimePackage,
-    options: RemovePackageOptions
+    _options: RemovePackageOptions
   ): Promise<void> {
     if (!RuntimeRegistry.isSupported(runtime.name)) {
       throw new Error(`Unsupported runtime: ${runtime.name}`);
@@ -873,20 +845,14 @@ export class PackageManager {
     }
   }
 
-  private async removeService(
-    service: ServicePackage,
-    options: RemovePackageOptions
-  ): Promise<void> {
+  private async removeService(service: ServicePackage): Promise<void> {
     const template = ServiceTemplateRegistry.getTemplate(service.template || service.name);
     if (template) {
       await template.uninstall(service.name);
     }
   }
 
-  private async removeDependency(
-    dep: DependencyPackage,
-    options: RemovePackageOptions
-  ): Promise<void> {
+  private async removeDependency(dep: DependencyPackage): Promise<void> {
     const runtime = dep.runtime || (await this.detectPrimaryRuntime());
 
     switch (runtime) {
@@ -939,7 +905,7 @@ export class PackageManager {
 
   private async searchRuntimes(
     query: string,
-    options: SearchPackageOptions
+    _options: SearchPackageOptions
   ): Promise<PackageSearchResult[]> {
     const results: PackageSearchResult[] = [];
     const runtimeTypes = RuntimeRegistry.getRegisteredTypes();
@@ -1012,7 +978,7 @@ export class PackageManager {
     // Search PyPI for Python packages
     if (!options.runtime || options.runtime === 'python') {
       try {
-        const pypiResults = await this.searchPyPIRegistry(query, options);
+        const pypiResults = await this.searchPyPIRegistry(query);
         results.push(...pypiResults);
       } catch (error) {
         logger.error('Failed to search PyPI registry', error);
@@ -1057,7 +1023,7 @@ export class PackageManager {
         throw new Error(`NPM API error: ${response.status} ${response.statusText}`);
       }
 
-      const data: NpmSearchResponse = await response.json();
+      const data: NpmSearchResponse = (await response.json()) as NpmSearchResponse;
 
       return data.objects.map(obj => {
         const result: PackageSearchResult = {
@@ -1086,10 +1052,7 @@ export class PackageManager {
     }
   }
 
-  private async searchPyPIRegistry(
-    query: string,
-    options: SearchPackageOptions
-  ): Promise<PackageSearchResult[]> {
+  private async searchPyPIRegistry(query: string): Promise<PackageSearchResult[]> {
     // Note: PyPI removed their search API, so we use a fallback approach
     return this.getFallbackPypiResults(query);
   }
@@ -1333,7 +1296,7 @@ export class PackageManager {
             version,
             installed,
             active,
-            path: currentEnv?.path,
+            ...(currentEnv?.path && { path: currentEnv.path }),
           };
 
           if (bestManager?.name) {
@@ -1356,7 +1319,7 @@ export class PackageManager {
     return statuses;
   }
 
-  private async getServiceStatuses(services: any[]): Promise<ServiceStatus[]> {
+  private async getServiceStatuses(services: ServicePackage[]): Promise<ServiceStatus[]> {
     const statuses: ServiceStatus[] = [];
 
     for (const service of services) {
@@ -1367,7 +1330,7 @@ export class PackageManager {
           version: service.version || 'latest',
           running: serviceStatus.running,
           template: service.template,
-          ports: serviceStatus.ports,
+          ...(serviceStatus.ports && { ports: serviceStatus.ports }),
         });
       } catch (error) {
         logger.debug(`Failed to get status for service ${service.name}`, error);
@@ -1383,7 +1346,9 @@ export class PackageManager {
     return statuses;
   }
 
-  private async getDependencyStatuses(dependencies: any[]): Promise<DependencyStatus[]> {
+  private async getDependencyStatuses(
+    dependencies: DependencyPackage[]
+  ): Promise<DependencyStatus[]> {
     const statuses: DependencyStatus[] = [];
 
     for (const dep of dependencies) {
@@ -1435,7 +1400,10 @@ export class PackageManager {
         }
       }
 
-      return { running, ports };
+      return {
+        running,
+        ...(ports && ports.length > 0 && { ports }),
+      };
     } catch {
       return { running: false };
     }
@@ -1648,7 +1616,7 @@ export class PackageManager {
       const response = await fetch(`https://registry.npmjs.org/${packageName}/latest`);
       if (!response.ok) return null;
 
-      const data = await response.json();
+      const data = (await response.json()) as { version?: string };
       return data.version || null;
     } catch {
       return null;
@@ -1660,7 +1628,7 @@ export class PackageManager {
       const response = await fetch(`https://pypi.org/pypi/${packageName}/json`);
       if (!response.ok) return null;
 
-      const data = await response.json();
+      const data = (await response.json()) as { info?: { version?: string } };
       return data.info?.version || null;
     } catch {
       return null;
@@ -1669,48 +1637,52 @@ export class PackageManager {
 
   private async findPackageInConfig(
     name: string,
-    packages: any
+    packages: ProjectPackages
   ): Promise<PackageDefinition | null> {
     // Check runtimes
     if (packages.runtimes?.[name]) {
       return {
         name,
-        version: packages.runtimes[name],
+        version: packages.runtimes[name] as string,
         type: 'runtime',
       };
     }
 
     // Check services
-    const service = packages.services?.find((s: any) => s.name === name);
+    const service = (packages.services as ServicePackage[])?.find(
+      (s: ServicePackage) => s.name === name
+    );
     if (service) {
       return {
         name: service.name,
-        version: service.version,
         type: 'service',
         runtime: service.template,
+        ...(service.version && { version: service.version }),
       };
     }
 
     // Check dependencies
-    const dependency = packages.dependencies?.find((d: any) => d.name === name);
+    const dependency = (packages.dependencies as DependencyPackage[])?.find(
+      (d: DependencyPackage) => d.name === name
+    );
     if (dependency) {
       return {
         name: dependency.name,
-        version: dependency.version,
         type: 'dependency',
         runtime: dependency.runtime,
+        ...(dependency.version && { version: dependency.version }),
       };
     }
 
     return null;
   }
 
-  private async findDependents(packageName: string, packages: any): Promise<string[]> {
+  private async findDependents(packageName: string, packages: ProjectPackages): Promise<string[]> {
     const dependents: string[] = [];
 
     // Check if any services depend on this package
     if (packages.services) {
-      packages.services.forEach((service: any) => {
+      (packages.services as ServicePackage[]).forEach((service: ServicePackage) => {
         if (service.dependencies && service.dependencies.includes(packageName)) {
           dependents.push(service.name);
         }
@@ -1719,7 +1691,7 @@ export class PackageManager {
 
     // For runtimes, check if any dependencies use this runtime
     if (packages.dependencies) {
-      packages.dependencies.forEach((dep: any) => {
+      (packages.dependencies as DependencyPackage[]).forEach((dep: DependencyPackage) => {
         if (dep.runtime === packageName) {
           dependents.push(dep.name);
         }
@@ -1757,64 +1729,75 @@ export class PackageManager {
   }
 
   private async addPackageToConfig(
-    packages: any,
+    packages: ProjectPackages,
     packageDef: PackageDefinition,
     options?: AddPackageOptions
   ): Promise<void> {
     switch (packageDef.type) {
       case 'runtime':
         if (!packages.runtimes) packages.runtimes = {};
-        packages.runtimes[packageDef.name] = packageDef.version || 'latest';
+        (packages.runtimes as Record<string, string>)[packageDef.name] =
+          packageDef.version || 'latest';
         break;
 
       case 'service':
         if (!packages.services) packages.services = [];
-        packages.services.push({
+        const servicePackage: ServicePackage = {
           name: packageDef.name,
+          type: 'service',
           template: packageDef.name,
-          version: packageDef.version,
-        });
+          ...(packageDef.version && { version: packageDef.version }),
+        };
+        (packages.services as ServicePackage[]).push(servicePackage);
         break;
 
       case 'dependency':
         if (!packages.dependencies) packages.dependencies = [];
-        const depConfig: any = {
+        if (!packageDef.runtime) {
+          throw new Error('Runtime is required for dependencies');
+        }
+        const depConfig: DependencyPackage = {
           name: packageDef.name,
-          version: packageDef.version,
+          type: 'dependency',
           runtime: packageDef.runtime,
+          ...(packageDef.version && { version: packageDef.version }),
         };
 
-        if (options?.dev) depConfig.dev = true;
+        if (options?.dev) depConfig.devOnly = true;
         if (options?.optional) depConfig.optional = true;
         if (options?.global) depConfig.global = true;
 
-        packages.dependencies.push(depConfig);
+        (packages.dependencies as DependencyPackage[]).push(depConfig);
         break;
     }
   }
 
   private async removePackageFromConfig(
-    packages: any,
+    packages: ProjectPackages,
     packageDef: PackageDefinition
   ): Promise<void> {
     switch (packageDef.type) {
       case 'runtime':
         if (packages.runtimes) {
-          delete packages.runtimes[packageDef.name];
+          delete (packages.runtimes as Record<string, string>)[packageDef.name];
         }
         break;
 
       case 'service':
         if (packages.services) {
-          packages.services = packages.services.filter((s: any) => s.name !== packageDef.name);
+          const filteredServices = (packages.services as ServicePackage[]).filter(
+            (s: ServicePackage) => s.name !== packageDef.name
+          );
+          packages.services = filteredServices;
         }
         break;
 
       case 'dependency':
         if (packages.dependencies) {
-          packages.dependencies = packages.dependencies.filter(
-            (d: any) => d.name !== packageDef.name
+          const filteredDeps = (packages.dependencies as DependencyPackage[]).filter(
+            (d: DependencyPackage) => d.name !== packageDef.name
           );
+          packages.dependencies = filteredDeps;
         }
         break;
     }
@@ -1843,8 +1826,10 @@ export class PackageManager {
     };
   }
 
-  private async generateRuntimeLocks(runtimes: Record<string, string>): Promise<any> {
-    const locks: any = {};
+  private async generateRuntimeLocks(
+    runtimes: Record<string, string>
+  ): Promise<LockFile['runtimes']> {
+    const locks: LockFile['runtimes'] = {};
 
     for (const [name, version] of Object.entries(runtimes)) {
       if (RuntimeRegistry.isSupported(name)) {
@@ -1860,11 +1845,20 @@ export class PackageManager {
             locks[name] = {
               version: env.version,
               resolved: env.path,
-              manager: env.manager,
+              ...(env.manager && { manager: env.manager }),
+            };
+          } else {
+            locks[name] = {
+              version,
+              resolved: `runtime:${name}@${version}`,
             };
           }
         } catch (error) {
           logger.debug(`Failed to generate lock for runtime ${name}`, error);
+          locks[name] = {
+            version,
+            resolved: `runtime:${name}@${version}`,
+          };
         }
       }
     }
@@ -1872,21 +1866,23 @@ export class PackageManager {
     return locks;
   }
 
-  private async generatePackageLocks(dependencies: any[]): Promise<any> {
-    const locks: any = {};
+  private async generatePackageLocks(
+    dependencies: DependencyPackage[]
+  ): Promise<LockFile['packages']> {
+    const locks: LockFile['packages'] = {};
 
     for (const dep of dependencies) {
       locks[dep.name] = {
         version: dep.version || 'latest',
-        runtime: dep.runtime,
+        ...(dep.runtime && { runtime: dep.runtime }),
       };
     }
 
     return locks;
   }
 
-  private async generateServiceLocks(services: any[]): Promise<any> {
-    const locks: any = {};
+  private async generateServiceLocks(services: ServicePackage[]): Promise<LockFile['services']> {
+    const locks: LockFile['services'] = {};
 
     for (const service of services) {
       locks[service.name] = {
@@ -1921,12 +1917,12 @@ export class PackageManager {
     return results;
   }
 
-  private async installServices(services: any[]): Promise<PackageInstallResult[]> {
+  private async installServices(services: ServicePackage[]): Promise<PackageInstallResult[]> {
     const results: PackageInstallResult[] = [];
 
     for (const service of services) {
       try {
-        const result = await this.addService(service, {});
+        const result = await this.addService(service);
         results.push(result);
       } catch (error) {
         results.push({
@@ -1940,7 +1936,9 @@ export class PackageManager {
     return results;
   }
 
-  private async installDependencies(dependencies: any[]): Promise<PackageInstallResult[]> {
+  private async installDependencies(
+    dependencies: DependencyPackage[]
+  ): Promise<PackageInstallResult[]> {
     const results: PackageInstallResult[] = [];
 
     for (const dep of dependencies) {

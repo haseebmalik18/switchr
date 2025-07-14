@@ -7,6 +7,7 @@ import { ServiceDependencyResolver } from '../core/ServiceDependencyResolver';
 import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
 import { Service } from '../types/Project';
+import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 
 interface ServiceStartResult {
   service: string;
@@ -387,14 +388,39 @@ export default class Start extends Command {
     }
 
     if (service.template) {
-      // TODO: Generate command from service template
-      // This would integrate with your ServiceTemplateRegistry
-      throw new Error(
-        `Service template '${service.template}' not yet implemented for command generation`
-      );
+      // Generate command from service template
+      try {
+        const template = ServiceTemplateRegistry.getTemplate(service.template);
+        if (!template) {
+          throw new Error(`Service template '${service.template}' not found`);
+        }
+
+        // Use the template's getCommand method with service config
+        const config = service.config || {};
+        const command = template.getCommand(config);
+
+        // Replace any additional placeholders that might not be handled by the template
+        let finalCommand = command;
+
+        // Replace service-specific placeholders
+        if (service.port) {
+          finalCommand = finalCommand.replace(/{{port}}/g, service.port.toString());
+        }
+
+        if (service.name) {
+          finalCommand = finalCommand.replace(/{{name}}/g, service.name);
+        }
+
+        return finalCommand;
+      } catch (error) {
+        logger.error(`Failed to generate command from template '${service.template}':`, error);
+        throw new Error(
+          `Failed to generate command from service template '${service.template}': ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+      }
     }
 
-    throw new Error(`Service '${service.name}' has no command or template defined`);
+    throw new Error(`Service '${service.name}' has no command or template specified`);
   }
 
   private async waitForServiceReady(service: Service, timeoutSeconds: number): Promise<void> {

@@ -1,13 +1,14 @@
-// src/commands/update.ts - Complete production-quality implementation
+// src/commands/update.ts - Complete production implementation
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import ora from 'ora';
 import { ConfigManager } from '../core/ConfigManager';
-import { PackageManager } from '../core/PackageManager';
+import { PackageManager, type AddPackageOptions } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 import { logger } from '../utils/Logger';
 import { PackageInstallResult } from '../types/Package';
+import { RuntimeType } from '../types/Runtime';
 
 interface UpdateResult {
   name: string;
@@ -508,7 +509,7 @@ export default class Update extends Command {
   ): Promise<PackageInstallResult> {
     const packageSpec = `${update.name}@${update.latestVersion}`;
 
-    const addOptions: any = {
+    const addOptions: AddPackageOptions = {
       skipIfExists: false, // Force reinstall to update
     };
 
@@ -575,7 +576,7 @@ export default class Update extends Command {
     try {
       if (!RuntimeRegistry.isSupported(runtimeName)) return null;
 
-      const manager = RuntimeRegistry.create(runtimeName as any, process.cwd(), '/tmp');
+      const manager = RuntimeRegistry.create(runtimeName as RuntimeType, process.cwd(), '/tmp');
       const versions = await manager.listAvailable();
       return versions[0] || null; // First version is typically latest
     } catch {
@@ -617,26 +618,26 @@ export default class Update extends Command {
       const response = await fetch(`https://registry.npmjs.org/${packageName}/latest`);
       if (!response.ok) return null;
 
-      const data = await response.json();
+      const data = (await response.json()) as { version?: string };
       return data.version || null;
     } catch {
       return null;
     }
   }
 
-  private async getLatestPyPIVersion(packageName: string): Promise<string | null> {
+  private async getLatestPyPIVersion(_packageName: string): Promise<string | null> {
     try {
-      const response = await fetch(`https://pypi.org/pypi/${packageName}/json`);
+      const response = await fetch(`https://pypi.org/pypi/${_packageName}/json`);
       if (!response.ok) return null;
 
-      const data = await response.json();
+      const data = (await response.json()) as { info?: { version?: string } };
       return data.info?.version || null;
     } catch {
       return null;
     }
   }
 
-  private async getLatestGoVersion(packageName: string): Promise<string | null> {
+  private async getLatestGoVersion(_packageName: string): Promise<string | null> {
     try {
       // Go modules use semantic versioning tags
       // This would require integration with Go proxy or VCS

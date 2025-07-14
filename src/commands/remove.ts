@@ -1,11 +1,19 @@
 // src/commands/remove.ts - Fixed version with exactOptionalPropertyTypes support
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
+import inquirer from 'inquirer';
 import { ConfigManager } from '../core/ConfigManager';
 import { PackageManager } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 import { logger } from '../utils/Logger';
+import {
+  ProjectProfile,
+  ProjectPackages,
+  DependencyDefinition,
+  ServicePackageDefinition,
+  Service,
+} from '../types/Project';
 
 interface PackageExistsResult {
   found: boolean;
@@ -13,6 +21,18 @@ interface PackageExistsResult {
   version?: string;
   description?: string;
   installedAt?: string;
+}
+
+interface RemoveCommandFlags {
+  force: boolean;
+  'keep-data': boolean;
+  'dry-run': boolean;
+  'remove-unused': boolean;
+}
+
+interface DependentPackage {
+  name: string;
+  type: string;
 }
 
 export default class Remove extends Command {
@@ -105,7 +125,11 @@ export default class Remove extends Command {
     }
   }
 
-  private async showDryRun(packageName: string, project: any, flags: any): Promise<void> {
+  private async showDryRun(
+    packageName: string,
+    project: ProjectProfile,
+    flags: RemoveCommandFlags
+  ): Promise<void> {
     this.log(chalk.yellow('🧪 Dry run - showing what would be removed:\n'));
 
     // Check if package exists in project
@@ -151,7 +175,11 @@ export default class Remove extends Command {
     this.log(chalk.yellow('\n💡 Run without --dry-run to remove the package'));
   }
 
-  private async getConfirmation(packageName: string, project: any, flags: any): Promise<boolean> {
+  private async getConfirmation(
+    packageName: string,
+    project: ProjectProfile,
+    flags: RemoveCommandFlags
+  ): Promise<boolean> {
     const packageExists = await this.checkPackageExists(packageName, project);
 
     if (!packageExists.found) {
@@ -180,28 +208,41 @@ export default class Remove extends Command {
       this.log(chalk.yellow(`\n⚠️  Warning: Service data will be permanently deleted`));
     }
 
-    // Simple confirmation - in a real implementation you'd use inquirer
-    this.log(chalk.yellow(`\nAre you sure you want to remove ${packageName}? (y/N)`));
+    // Interactive confirmation
+    try {
+      const { confirmed } = await inquirer.prompt([
+        {
+          type: 'confirm',
+          name: 'confirmed',
+          message: `Are you sure you want to remove ${chalk.white(packageName)}?`,
+          default: false,
+        },
+      ]);
 
-    // For now, return true for dry-run purposes
-    // In real implementation, you'd prompt the user
-    return true;
+      return confirmed;
+    } catch (error) {
+      // Handle cases where inquirer fails (e.g., non-interactive environments)
+      logger.warn('Could not prompt for confirmation, defaulting to false');
+      return false;
+    }
   }
 
   private async checkPackageExists(
     packageName: string,
-    project: any
+    project: ProjectProfile
   ): Promise<PackageExistsResult> {
-    if (!project.packages) {
+    // Type-safe access to project packages
+    const packages: ProjectPackages | undefined = project.packages;
+    if (!packages) {
       return { found: false };
     }
 
     // Check runtimes
-    if (project.packages.runtimes && project.packages.runtimes[packageName]) {
+    if (packages.runtimes && packages.runtimes[packageName]) {
       const result: PackageExistsResult = {
         found: true,
         type: 'runtime',
-        version: project.packages.runtimes[packageName],
+        version: packages.runtimes[packageName],
         description: `${packageName} runtime environment`,
       };
 
@@ -219,14 +260,16 @@ export default class Remove extends Command {
     }
 
     // Check services
-    if (project.packages.services) {
-      const service = project.packages.services.find((s: any) => s.name === packageName);
+    if (packages.services) {
+      const service: ServicePackageDefinition | undefined = packages.services.find(
+        (s: ServicePackageDefinition) => s.name === packageName
+      );
       if (service) {
         const result: PackageExistsResult = {
           found: true,
           type: 'service',
-          version: service.version,
           description: `${service.template || packageName} service`,
+          ...(service.version && { version: service.version }),
         };
 
         // Only add installedAt if we can determine it
@@ -244,14 +287,16 @@ export default class Remove extends Command {
     }
 
     // Check dependencies
-    if (project.packages.dependencies) {
-      const dependency = project.packages.dependencies.find((d: any) => d.name === packageName);
+    if (packages.dependencies) {
+      const dependency: DependencyDefinition | undefined = packages.dependencies.find(
+        (d: DependencyDefinition) => d.name === packageName
+      );
       if (dependency) {
         const result: PackageExistsResult = {
           found: true,
           type: 'dependency',
-          version: dependency.version,
           description: `${dependency.runtime || 'unknown'} dependency`,
+          ...(dependency.version && { version: dependency.version }),
         };
 
         // Only add installedAt if we can determine it
@@ -271,7 +316,7 @@ export default class Remove extends Command {
     return { found: false };
   }
 
-  private async getInstallDate(packageName: string, type: string): Promise<string | null> {
+  private async getInstallDate(_packageName: string, _type: string): Promise<string | null> {
     try {
       // This would integrate with your package managers to get actual install dates
       // For now, return null to avoid undefined issues
@@ -283,13 +328,13 @@ export default class Remove extends Command {
 
   private async findDependents(
     packageName: string,
-    project: any
-  ): Promise<Array<{ name: string; type: string }>> {
-    const dependents: Array<{ name: string; type: string }> = [];
+    project: ProjectProfile
+  ): Promise<DependentPackage[]> {
+    const dependents: DependentPackage[] = [];
 
     // Check if any services depend on this package
     if (project.services) {
-      project.services.forEach((service: any) => {
+      project.services.forEach((service: Service) => {
         if (service.dependencies && service.dependencies.includes(packageName)) {
           dependents.push({ name: service.name, type: 'service' });
         }
@@ -297,8 +342,9 @@ export default class Remove extends Command {
     }
 
     // For runtimes, check if any dependencies use this runtime
-    if (project.packages?.dependencies) {
-      project.packages.dependencies.forEach((dep: any) => {
+    const packages: ProjectPackages | undefined = project.packages;
+    if (packages?.dependencies) {
+      packages.dependencies.forEach((dep: DependencyDefinition) => {
         if (dep.runtime === packageName) {
           dependents.push({ name: dep.name, type: 'dependency' });
         }
@@ -308,13 +354,14 @@ export default class Remove extends Command {
     return dependents;
   }
 
-  private showSimilarPackages(packageName: string, project: any): void {
-    if (!project.packages) return;
+  private showSimilarPackages(packageName: string, project: ProjectProfile): void {
+    const packages: ProjectPackages | undefined = project.packages;
+    if (!packages) return;
 
     const allPackages = [
-      ...Object.keys(project.packages.runtimes || {}),
-      ...(project.packages.services || []).map((s: any) => s.name),
-      ...(project.packages.dependencies || []).map((d: any) => d.name),
+      ...Object.keys(packages.runtimes || {}),
+      ...(packages.services || []).map((s: ServicePackageDefinition) => s.name),
+      ...(packages.dependencies || []).map((d: DependencyDefinition) => d.name),
     ];
 
     const similar = allPackages.filter(
@@ -336,7 +383,7 @@ export default class Remove extends Command {
     }
   }
 
-  private showNextSteps(packageName: string): void {
+  private showNextSteps(_packageName: string): void {
     this.log(chalk.blue('\n🎯 Next steps:'));
     this.log(chalk.gray(`   • Check project status: ${chalk.white('switchr status')}`));
     this.log(chalk.gray(`   • View remaining packages: ${chalk.white('switchr packages')}`));

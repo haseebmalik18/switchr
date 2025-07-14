@@ -6,7 +6,13 @@ import { ConfigManager } from '../core/ConfigManager';
 import { PackageManager } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
+import { NPMRegistry } from '../core/registry/NPMRegistry';
+import { PyPIRegistry } from '../core/registry/PyPiRegistry';
+import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
+import { RuntimeType } from '../types/Runtime';
+import * as fs from 'fs-extra';
+import * as path from 'path';
 
 interface PackageInfo {
   name: string;
@@ -22,6 +28,10 @@ interface PackageInfo {
   lastUpdated?: string;
   outdated?: boolean;
   latestVersion?: string;
+  downloadCount?: number;
+  description?: string;
+  homepage?: string;
+  repository?: string;
 }
 
 interface PackageSummary {
@@ -31,6 +41,26 @@ interface PackageSummary {
   runtimes: number;
   services: number;
   dependencies: number;
+}
+
+interface PackagesCommandFlags {
+  outdated: boolean;
+  tree: boolean;
+  json: boolean;
+  type: string | undefined;
+  detailed: boolean;
+}
+
+interface PackageStatus {
+  runtimes: Array<{ name: string; version: string; manager?: string }>;
+  services: Array<{ name: string; template?: string; version?: string; running?: boolean }>;
+  dependencies: Array<{ name: string; version?: string; runtime?: string; dev?: boolean }>;
+}
+
+interface DependencyTreeNode {
+  name: string;
+  version?: string;
+  dependencies?: DependencyTreeNode[];
 }
 
 export default class Packages extends Command {
@@ -74,6 +104,13 @@ export default class Packages extends Command {
     }),
   };
 
+  private configManager: ConfigManager;
+
+  constructor(argv: string[], config: import('@oclif/core').Config) {
+    super(argv, config);
+    this.configManager = ConfigManager.getInstance();
+  }
+
   public async run(): Promise<void> {
     const { flags } = await this.parse(Packages);
 
@@ -84,8 +121,7 @@ export default class Packages extends Command {
       await ServiceTemplateRegistry.initialize();
       spinner.succeed('Package registries initialized');
 
-      const configManager = ConfigManager.getInstance();
-      const currentProject = await configManager.getCurrentProject();
+      const currentProject = await this.configManager.getCurrentProject();
 
       if (!currentProject) {
         this.error(
@@ -95,7 +131,7 @@ export default class Packages extends Command {
 
       const packageManager = new PackageManager({
         projectPath: currentProject.path,
-        cacheDir: configManager.getConfigDir(),
+        cacheDir: this.configManager.getConfigDir(),
       });
 
       if (flags.outdated) {
@@ -111,7 +147,10 @@ export default class Packages extends Command {
     }
   }
 
-  private async showPackageOverview(packageManager: PackageManager, flags: any): Promise<void> {
+  private async showPackageOverview(
+    packageManager: PackageManager,
+    flags: PackagesCommandFlags
+  ): Promise<void> {
     const spinner = ora('Analyzing packages...').start();
 
     try {
@@ -119,7 +158,7 @@ export default class Packages extends Command {
       const packages = await this.buildPackageList(status, flags);
       const summary = this.calculateSummary(packages);
 
-      spinner.succeed(`Found ${summary.total} packages`);
+      spinner.stop();
 
       if (flags.json) {
         this.outputJson(packages, summary);
@@ -133,69 +172,60 @@ export default class Packages extends Command {
     }
   }
 
-  private async buildPackageList(status: any, flags: any): Promise<PackageInfo[]> {
+  private async buildPackageList(
+    status: PackageStatus,
+    flags: PackagesCommandFlags
+  ): Promise<PackageInfo[]> {
     const packages: PackageInfo[] = [];
 
-    // Process runtimes
-    if (!flags.type || flags.type === 'runtime') {
-      for (const runtime of status.runtimes) {
-        const pkg: PackageInfo = {
-          name: runtime.name,
-          type: 'runtime',
-          version: runtime.version,
-          installed: runtime.installed,
-          active: runtime.active,
-          manager: runtime.manager,
-        };
-
-        if (flags.detailed || flags.sizes) {
-          const details = await this.getRuntimeDetails(runtime.name, runtime.version);
-          Object.assign(pkg, details);
-        }
-
-        packages.push(pkg);
-      }
+    // Add runtimes
+    for (const runtime of status.runtimes) {
+      const details = await this.getRuntimeDetails(runtime.name, runtime.version);
+      packages.push({
+        name: runtime.name,
+        type: 'runtime',
+        version: runtime.version,
+        installed: true,
+        ...(runtime.manager && { manager: runtime.manager }),
+        ...details,
+      });
     }
 
-    // Process services
-    if (!flags.type || flags.type === 'service') {
-      for (const service of status.services) {
-        const pkg: PackageInfo = {
-          name: service.name,
-          type: 'service',
-          version: service.version,
-          installed: true, // Services are installed if they're in the config
-          running: service.running,
-          template: service.template,
-        };
-
-        if (flags.detailed || flags.sizes) {
-          const details = await this.getServiceDetails(service.name);
-          Object.assign(pkg, details);
-        }
-
-        packages.push(pkg);
-      }
+    // Add services
+    for (const service of status.services) {
+      const details = await this.getServiceDetails(service.name);
+      packages.push({
+        name: service.name,
+        type: 'service',
+        version: service.version || 'latest',
+        installed: true,
+        ...(service.template && { template: service.template }),
+        ...(service.running !== undefined && { running: service.running }),
+        ...details,
+      });
     }
 
-    // Process dependencies
-    if (!flags.type || flags.type === 'dependency') {
-      for (const dependency of status.dependencies) {
-        const pkg: PackageInfo = {
-          name: dependency.name,
-          type: 'dependency',
-          version: dependency.version,
-          installed: dependency.installed,
-          runtime: dependency.runtime,
-        };
+    // Add dependencies
+    for (const dep of status.dependencies) {
+      const details = await this.getDependencyDetails(dep.name, dep.runtime);
+      packages.push({
+        name: dep.name,
+        type: 'dependency',
+        version: dep.version || 'unknown',
+        installed: true,
+        ...(dep.runtime && { runtime: dep.runtime }),
+        ...details,
+      });
+    }
 
-        if (flags.detailed || flags.sizes) {
-          const details = await this.getDependencyDetails(dependency.name, dependency.runtime);
-          Object.assign(pkg, details);
-        }
+    // Filter by type if specified
+    if (flags.type) {
+      return packages.filter(pkg => pkg.type === flags.type);
+    }
 
-        packages.push(pkg);
-      }
+    // Check for updates if requested
+    if (flags.outdated) {
+      return this.checkForUpdates(packages);
     }
 
     return packages;
@@ -215,18 +245,24 @@ export default class Packages extends Command {
   private displayPackageOverview(
     packages: PackageInfo[],
     summary: PackageSummary,
-    flags: any
+    flags: PackagesCommandFlags
   ): void {
-    // Display header
-    this.log(chalk.blue(`📦 Package Overview\n`));
+    this.log(chalk.blue('📦 Project Packages\n'));
 
-    // Display summary
     this.displaySummary(summary);
 
-    // Display packages by type
-    this.displayPackagesByType(packages, flags);
+    if (flags.outdated) {
+      const outdatedPackages = packages.filter(pkg => pkg.outdated);
+      if (outdatedPackages.length > 0) {
+        this.log(chalk.yellow(`\n⚠️  ${outdatedPackages.length} packages have updates available:`));
+        outdatedPackages.forEach(pkg => this.displayPackage(pkg, flags));
+      } else {
+        this.log(chalk.green('\n✅ All packages are up to date'));
+      }
+    } else {
+      this.displayPackagesByType(packages, flags);
+    }
 
-    // Display footer with actions
     this.displayFooter();
   }
 
@@ -247,106 +283,92 @@ export default class Packages extends Command {
     this.log('');
   }
 
-  private displayPackagesByType(packages: PackageInfo[], flags: any): void {
-    const types = ['runtime', 'service', 'dependency'] as const;
+  private displayPackagesByType(packages: PackageInfo[], flags: PackagesCommandFlags): void {
+    const packagesByType = packages.reduce(
+      (acc, pkg) => {
+        acc[pkg.type].push(pkg);
+        return acc;
+      },
+      { runtime: [], service: [], dependency: [] } as Record<string, PackageInfo[]>
+    );
 
-    for (const type of types) {
-      const typePackages = packages.filter(p => p.type === type);
-      if (typePackages.length === 0) continue;
-
-      this.log(chalk.blue(`${this.getTypeIcon(type)} ${type.toUpperCase()}:`));
-
-      typePackages.forEach(pkg => {
-        this.displayPackage(pkg, flags);
-      });
-
-      this.log('');
-    }
+    Object.entries(packagesByType).forEach(([type, typePackages]) => {
+      if (typePackages.length > 0) {
+        this.log(
+          chalk.blue(
+            `\n${this.getTypeIcon(type)} ${type.charAt(0).toUpperCase() + type.slice(1)}s:`
+          )
+        );
+        typePackages.forEach(pkg => this.displayPackage(pkg, flags));
+      }
+    });
   }
 
-  private displayPackage(pkg: PackageInfo, flags: any): void {
+  private displayPackage(pkg: PackageInfo, flags: PackagesCommandFlags): void {
     const statusIcon = this.getPackageStatusIcon(pkg);
-    const nameDisplay = chalk.white(pkg.name);
-    const versionDisplay = chalk.gray(`@${pkg.version}`);
+    const versionDisplay =
+      pkg.outdated && pkg.latestVersion
+        ? chalk.yellow(`${pkg.version} → ${pkg.latestVersion}`)
+        : pkg.version;
 
-    let statusText = '';
-    if (pkg.type === 'runtime') {
-      statusText = pkg.active ? chalk.green('Active') : chalk.gray('Installed');
-    } else if (pkg.type === 'service') {
-      statusText = pkg.running ? chalk.green('Running') : chalk.red('Stopped');
-    } else {
-      statusText = pkg.installed ? chalk.green('Installed') : chalk.red('Missing');
-    }
+    this.log(`   ${statusIcon} ${chalk.white(pkg.name)} ${chalk.gray(versionDisplay)}`);
 
-    this.log(`  ${statusIcon} ${nameDisplay}${versionDisplay} - ${statusText}`);
-
-    // Show additional details if requested
     if (flags.detailed) {
       this.displayPackageDetails(pkg, flags);
     }
   }
 
-  private displayPackageDetails(pkg: PackageInfo, flags: any): void {
+  private displayPackageDetails(pkg: PackageInfo, _flags: PackagesCommandFlags): void {
     if (pkg.manager) {
-      this.log(chalk.gray(`    Manager: ${pkg.manager}`));
+      this.log(chalk.gray(`     Manager: ${pkg.manager}`));
     }
-
     if (pkg.template) {
-      this.log(chalk.gray(`    Template: ${pkg.template}`));
+      this.log(chalk.gray(`     Template: ${pkg.template}`));
     }
-
-    if (pkg.runtime) {
-      this.log(chalk.gray(`    Runtime: ${pkg.runtime}`));
+    if (pkg.runtime && pkg.type === 'dependency') {
+      this.log(chalk.gray(`     Runtime: ${pkg.runtime}`));
     }
-
-    if (flags.sizes && pkg.size) {
-      this.log(chalk.gray(`    Size: ${pkg.size}`));
+    if (pkg.size) {
+      this.log(chalk.gray(`     Size: ${pkg.size}`));
     }
-
     if (pkg.lastUpdated) {
-      this.log(chalk.gray(`    Last updated: ${pkg.lastUpdated}`));
-    }
-
-    if (pkg.outdated && pkg.latestVersion) {
-      this.log(chalk.yellow(`    Latest version: ${pkg.latestVersion}`));
+      this.log(chalk.gray(`     Updated: ${pkg.lastUpdated}`));
     }
   }
 
-  private async showOutdatedPackages(packageManager: PackageManager, flags: any): Promise<void> {
-    const spinner = ora('🔍 Checking for outdated packages...').start();
+  private async showOutdatedPackages(
+    packageManager: PackageManager,
+    flags: PackagesCommandFlags
+  ): Promise<void> {
+    const spinner = ora('Checking for updates...').start();
 
     try {
       const status = await packageManager.getPackageStatus();
       const packages = await this.buildPackageList(status, flags);
-
-      // Check for updates
       const outdatedPackages = await this.checkForUpdates(packages);
 
       spinner.stop();
 
-      if (flags.json) {
-        this.log(JSON.stringify(outdatedPackages, null, 2));
-        return;
-      }
+      const outdated = outdatedPackages.filter(pkg => pkg.outdated);
 
-      if (outdatedPackages.length === 0) {
+      if (outdated.length === 0) {
         this.log(chalk.green('✅ All packages are up to date'));
         return;
       }
 
-      this.log(chalk.yellow(`📋 ${outdatedPackages.length} outdated package(s):\n`));
+      this.log(chalk.yellow(`⚠️  ${outdated.length} packages have updates available:\n`));
 
-      outdatedPackages.forEach(pkg => {
-        const current = chalk.red(pkg.version);
-        const latest = chalk.green(pkg.latestVersion || 'unknown');
-        const breaking = this.isBreakingChange(pkg.version, pkg.latestVersion || '')
-          ? chalk.red(' (BREAKING)')
-          : '';
+      outdated.forEach(pkg => {
+        const versionDisplay = pkg.latestVersion
+          ? `${pkg.version} → ${chalk.green(pkg.latestVersion)}`
+          : pkg.version;
 
-        this.log(`  ${chalk.white(pkg.name)}: ${current} → ${latest}${breaking}`);
+        this.log(`   ${this.getTypeIcon(pkg.type)} ${chalk.white(pkg.name)} ${versionDisplay}`);
 
-        if (pkg.type === 'runtime' && pkg.manager) {
-          this.log(chalk.gray(`    Manager: ${pkg.manager}`));
+        if (pkg.manager) {
+          this.log(
+            chalk.gray(`     Update with: ${pkg.manager} install ${pkg.name}@${pkg.latestVersion}`)
+          );
         }
       });
 
@@ -357,12 +379,15 @@ export default class Packages extends Command {
     }
   }
 
-  private async showDependencyTree(packageManager: PackageManager, flags: any): Promise<void> {
-    const spinner = ora('🌳 Building dependency tree...').start();
+  private async showDependencyTree(
+    packageManager: PackageManager,
+    flags: PackagesCommandFlags
+  ): Promise<void> {
+    const spinner = ora('Building dependency tree...').start();
 
     try {
       const tree = await this.buildDependencyTree(packageManager);
-      spinner.succeed('Dependency tree built');
+      spinner.stop();
 
       if (flags.json) {
         this.log(JSON.stringify(tree, null, 2));
@@ -370,12 +395,6 @@ export default class Packages extends Command {
       }
 
       this.log(chalk.blue('🌳 Dependency Tree\n'));
-
-      if (!tree || Object.keys(tree).length === 0) {
-        this.log(chalk.gray('No dependencies found'));
-        return;
-      }
-
       this.displayTree(tree);
     } catch (error) {
       spinner.fail('Failed to build dependency tree');
@@ -383,47 +402,93 @@ export default class Packages extends Command {
     }
   }
 
-  private displayTree(tree: any, prefix: string = '', isLast: boolean = true): void {
-    if (typeof tree === 'string') {
-      const connector = isLast ? '└── ' : '├── ';
-      this.log(`${prefix}${connector}${chalk.white(tree)}`);
-      return;
+  private displayTree(tree: DependencyTreeNode, prefix: string = '', isLast: boolean = true): void {
+    const connector = isLast ? '└── ' : '├── ';
+    const versionDisplay = tree.version ? chalk.gray(`@${tree.version}`) : '';
+
+    this.log(`${prefix}${connector}${chalk.white(tree.name)}${versionDisplay}`);
+
+    if (tree.dependencies && tree.dependencies.length > 0) {
+      const newPrefix = prefix + (isLast ? '    ' : '│   ');
+      tree.dependencies.forEach((dep, index) => {
+        const isLastDep = index === tree.dependencies!.length - 1;
+        this.displayTree(dep, newPrefix, isLastDep);
+      });
     }
-
-    Object.entries(tree).forEach(([name, dependencies], index, entries) => {
-      const isLastEntry = index === entries.length - 1;
-      const connector = isLastEntry ? '└── ' : '├── ';
-
-      this.log(`${prefix}${connector}${chalk.white(name)}`);
-
-      if (dependencies && typeof dependencies === 'object') {
-        const newPrefix = prefix + (isLastEntry ? '    ' : '│   ');
-        this.displayTree(dependencies, newPrefix, true);
-      }
-    });
   }
 
   // Helper methods for getting package details
   private async getRuntimeDetails(name: string, version: string): Promise<Partial<PackageInfo>> {
     try {
-      // This would integrate with runtime managers to get actual details
-      return {
-        size: 'Unknown',
-        lastUpdated: 'Unknown',
-      };
-    } catch {
+      // Initialize RuntimeRegistry if not already done
+      await RuntimeRegistry.initialize();
+
+      if (!RuntimeRegistry.isSupported(name)) {
+        return {};
+      }
+
+      const manager = RuntimeRegistry.create(
+        name as RuntimeType,
+        this.configManager.getConfigDir(),
+        this.configManager.getConfigDir()
+      );
+
+      // Get runtime environment info
+      const currentEnv = await manager.getCurrentVersion();
+      const bestManager = await manager.getBestManager();
+
+      const details: Partial<PackageInfo> = {};
+
+      // Get manager info
+      if (bestManager) {
+        details.manager = bestManager.name;
+      }
+
+      // Get installation size
+      details.size = await this.getRuntimeSize(name, version);
+
+      // Get last updated date
+      details.lastUpdated = await this.getRuntimeLastUpdated(name, version);
+
+      // Check if runtime is active
+      details.active = currentEnv?.version === version;
+
+      return details;
+    } catch (error) {
+      logger.debug(`Failed to get runtime details for ${name}:`, error);
       return {};
     }
   }
 
   private async getServiceDetails(name: string): Promise<Partial<PackageInfo>> {
     try {
-      // This would integrate with service managers to get actual details
-      return {
-        size: 'Unknown',
-        lastUpdated: 'Unknown',
-      };
-    } catch {
+      // Initialize ServiceTemplateRegistry if not already done
+      await ServiceTemplateRegistry.initialize();
+
+      const template = ServiceTemplateRegistry.getTemplate(name);
+      if (!template) {
+        return {};
+      }
+
+      const templateInfo = template.getTemplate();
+      const details: Partial<PackageInfo> = {};
+
+      // Get template info
+      details.template = templateInfo.name;
+      details.description = templateInfo.description;
+
+      // Get service size
+      details.size = await this.getServiceSize(name);
+
+      // Get last updated date
+      details.lastUpdated = await this.getServiceLastUpdated(name);
+
+      // Check if service is running
+      details.running = await this.isServiceRunning(name);
+
+      return details;
+    } catch (error) {
+      logger.debug(`Failed to get service details for ${name}:`, error);
       return {};
     }
   }
@@ -433,104 +498,603 @@ export default class Packages extends Command {
     runtime?: string
   ): Promise<Partial<PackageInfo>> {
     try {
-      // This would integrate with package managers to get actual details
-      return {
-        size: 'Unknown',
-        lastUpdated: 'Unknown',
-      };
-    } catch {
+      if (!runtime) {
+        return {};
+      }
+
+      const details: Partial<PackageInfo> = {};
+
+      // Get package manager for runtime
+      const manager = await this.getPackageManagerForRuntime(runtime);
+      if (manager) {
+        details.manager = manager;
+      }
+
+      // Get dependency size and details
+      const size = await this.getDependencySize(name, runtime);
+      if (size) {
+        details.size = size;
+      }
+
+      const lastUpdated = await this.getDependencyLastUpdated(name, runtime);
+      if (lastUpdated) {
+        details.lastUpdated = lastUpdated;
+      }
+
+      // Get additional package info from registries
+      const packageInfo = await this.getDependencyRegistryInfo(name, runtime);
+      if (packageInfo) {
+        if (packageInfo.description) {
+          details.description = packageInfo.description;
+        }
+        if (packageInfo.homepage) {
+          details.homepage = packageInfo.homepage;
+        }
+        if (packageInfo.repository) {
+          details.repository = packageInfo.repository;
+        }
+        if (packageInfo.downloadCount) {
+          details.downloadCount = packageInfo.downloadCount;
+        }
+      }
+
+      return details;
+    } catch (error) {
+      logger.debug(`Failed to get dependency details for ${name}:`, error);
       return {};
     }
   }
 
   private async checkForUpdates(packages: PackageInfo[]): Promise<PackageInfo[]> {
-    const outdated: PackageInfo[] = [];
+    const results = [...packages];
 
-    for (const pkg of packages) {
+    // Process packages in parallel for better performance
+    const updatePromises = results.map(async pkg => {
       try {
         const latestVersion = await this.getLatestVersion(pkg);
         if (latestVersion && this.isVersionOutdated(pkg.version, latestVersion)) {
           pkg.outdated = true;
           pkg.latestVersion = latestVersion;
-          outdated.push(pkg);
         }
-      } catch {
-        // Ignore errors when checking for updates
+      } catch (error) {
+        logger.debug(`Failed to check updates for ${pkg.name}:`, error);
       }
-    }
+    });
 
-    return outdated;
+    await Promise.allSettled(updatePromises);
+    return results;
   }
 
   private async getLatestVersion(pkg: PackageInfo): Promise<string | null> {
-    // This would integrate with package registries
-    // For now, return null to indicate no update available
+    try {
+      switch (pkg.type) {
+        case 'runtime':
+          return await this.getLatestRuntimeVersion(pkg.name);
+        case 'service':
+          return await this.getLatestServiceVersion(pkg.name);
+        case 'dependency':
+          return await this.getLatestDependencyVersion(pkg.name, pkg.runtime);
+        default:
+          return null;
+      }
+    } catch (error) {
+      logger.debug(`Failed to get latest version for ${pkg.name}:`, error);
+      return null;
+    }
+  }
+
+  // Runtime-specific methods
+  private async getRuntimeSize(name: string, _version: string): Promise<string> {
+    try {
+      const manager = RuntimeRegistry.create(
+        name as RuntimeType,
+        this.configManager.getConfigDir(),
+        this.configManager.getConfigDir()
+      );
+      const env = await manager.getCurrentVersion();
+
+      if (env?.path) {
+        const size = await this.getDirectorySize(env.path);
+        return this.formatSize(size);
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  private async getRuntimeLastUpdated(name: string, _version: string): Promise<string> {
+    try {
+      const manager = RuntimeRegistry.create(
+        name as RuntimeType,
+        this.configManager.getConfigDir(),
+        this.configManager.getConfigDir()
+      );
+      const env = await manager.getCurrentVersion();
+
+      if (env?.path) {
+        const stats = await fs.stat(env.path);
+        return this.formatDate(stats.mtime);
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  private async getLatestRuntimeVersion(runtimeName: string): Promise<string | null> {
+    try {
+      const manager = RuntimeRegistry.create(
+        runtimeName as RuntimeType,
+        this.configManager.getConfigDir(),
+        this.configManager.getConfigDir()
+      );
+      const available = await manager.listAvailable();
+
+      if (available.length > 0) {
+        // Return the latest stable version (assumes versions are sorted)
+        return available.filter(v => !v.includes('-')).pop() || available[0];
+      }
+    } catch {
+      // Ignore errors
+    }
     return null;
   }
 
+  // Service-specific methods
+  private async getServiceSize(name: string): Promise<string> {
+    try {
+      // For Docker-based services, get image size
+      const result = await ProcessUtils.execute('docker', [
+        'images',
+        '--format',
+        'table {{.Repository}}:{{.Tag}}\t{{.Size}}',
+      ]);
+      const lines = result.stdout.split('\n');
+
+      for (const line of lines) {
+        if (line.toLowerCase().includes(name.toLowerCase())) {
+          const parts = line.split('\t');
+          if (parts.length > 1) {
+            return parts[1];
+          }
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  private async getServiceLastUpdated(name: string): Promise<string> {
+    try {
+      // Check Docker image creation date
+      const result = await ProcessUtils.execute('docker', [
+        'inspect',
+        '--format',
+        '{{.Created}}',
+        name,
+      ]);
+      if (result.exitCode === 0) {
+        const createdDate = new Date(result.stdout.trim());
+        return this.formatDate(createdDate);
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  private async getLatestServiceVersion(serviceName: string): Promise<string | null> {
+    try {
+      const template = ServiceTemplateRegistry.getTemplate(serviceName);
+      if (template) {
+        const templateInfo = template.getTemplate();
+        return templateInfo.version;
+      }
+    } catch {
+      // Ignore errors
+    }
+    return null;
+  }
+
+  private async isServiceRunning(serviceName: string): Promise<boolean> {
+    try {
+      const result = await ProcessUtils.execute('docker', [
+        'ps',
+        '--filter',
+        `name=${serviceName}`,
+        '--format',
+        '{{.Names}}',
+      ]);
+      return result.stdout.includes(serviceName);
+    } catch {
+      return false;
+    }
+  }
+
+  // Dependency-specific methods
+  private async getDependencySize(name: string, runtime?: string): Promise<string> {
+    try {
+      switch (runtime) {
+        case 'nodejs':
+          return await this.getNodePackageSize(name);
+        case 'python':
+          return await this.getPythonPackageSize(name);
+        default:
+          return 'Unknown';
+      }
+    } catch {
+      return 'Unknown';
+    }
+  }
+
+  private async getDependencyLastUpdated(name: string, runtime?: string): Promise<string> {
+    try {
+      switch (runtime) {
+        case 'nodejs':
+          return await this.getNodePackageLastUpdated(name);
+        case 'python':
+          return await this.getPythonPackageLastUpdated(name);
+        default:
+          return 'Unknown';
+      }
+    } catch {
+      return 'Unknown';
+    }
+  }
+
+  private async getLatestDependencyVersion(name: string, runtime?: string): Promise<string | null> {
+    try {
+      switch (runtime) {
+        case 'nodejs':
+          const npmInfo = await NPMRegistry.getPackageInfo(name);
+          return npmInfo?.version || null;
+        case 'python':
+          const pypiInfo = await PyPIRegistry.getPackageInfo(name);
+          return pypiInfo?.version || null;
+        default:
+          return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async getDependencyRegistryInfo(
+    name: string,
+    runtime?: string
+  ): Promise<Partial<PackageInfo> | null> {
+    try {
+      switch (runtime) {
+        case 'nodejs':
+          const npmInfo = await NPMRegistry.getPackageInfo(name);
+          if (npmInfo) {
+            return {
+              ...(npmInfo.description && { description: npmInfo.description }),
+              ...(npmInfo.homepage && { homepage: npmInfo.homepage }),
+              ...(npmInfo.repository && { repository: npmInfo.repository }),
+            };
+          }
+          break;
+        case 'python':
+          const pypiInfo = await PyPIRegistry.getPackageInfo(name);
+          if (pypiInfo) {
+            return {
+              ...(pypiInfo.description && { description: pypiInfo.description }),
+              ...(pypiInfo.homepage && { homepage: pypiInfo.homepage }),
+              ...(pypiInfo.repository && { repository: pypiInfo.repository }),
+            };
+          }
+          break;
+      }
+    } catch {
+      // Ignore errors
+    }
+    return null;
+  }
+
+  // Package manager detection
+  private async getPackageManagerForRuntime(runtime: string): Promise<string> {
+    switch (runtime) {
+      case 'nodejs':
+        return await this.detectNodePackageManager();
+      case 'python':
+        return await this.detectPythonPackageManager();
+      case 'go':
+        return 'go mod';
+      case 'java':
+        return await this.detectJavaPackageManager();
+      case 'rust':
+        return 'cargo';
+      default:
+        return 'unknown';
+    }
+  }
+
+  private async detectNodePackageManager(): Promise<string> {
+    try {
+      const projectPath = (await this.configManager.getCurrentProject())?.path || process.cwd();
+
+      // Check for lock files to determine package manager
+      if (await fs.pathExists(path.join(projectPath, 'yarn.lock'))) {
+        return 'yarn';
+      }
+      if (await fs.pathExists(path.join(projectPath, 'pnpm-lock.yaml'))) {
+        return 'pnpm';
+      }
+      if (await fs.pathExists(path.join(projectPath, 'bun.lockb'))) {
+        return 'bun';
+      }
+      return 'npm';
+    } catch {
+      return 'npm';
+    }
+  }
+
+  private async detectPythonPackageManager(): Promise<string> {
+    try {
+      const projectPath = (await this.configManager.getCurrentProject())?.path || process.cwd();
+
+      if (await fs.pathExists(path.join(projectPath, 'Pipfile'))) {
+        return 'pipenv';
+      }
+      if (await fs.pathExists(path.join(projectPath, 'poetry.lock'))) {
+        return 'poetry';
+      }
+      if (await fs.pathExists(path.join(projectPath, 'requirements.txt'))) {
+        return 'pip';
+      }
+      return 'pip';
+    } catch {
+      return 'pip';
+    }
+  }
+
+  private async detectJavaPackageManager(): Promise<string> {
+    try {
+      const projectPath = (await this.configManager.getCurrentProject())?.path || process.cwd();
+
+      if (await fs.pathExists(path.join(projectPath, 'pom.xml'))) {
+        return 'maven';
+      }
+      if (await fs.pathExists(path.join(projectPath, 'build.gradle'))) {
+        return 'gradle';
+      }
+      return 'maven';
+    } catch {
+      return 'maven';
+    }
+  }
+
+  // Node.js specific package info
+  private async getNodePackageSize(packageName: string): Promise<string> {
+    try {
+      const projectPath = (await this.configManager.getCurrentProject())?.path || process.cwd();
+      const packagePath = path.join(projectPath, 'node_modules', packageName);
+
+      if (await fs.pathExists(packagePath)) {
+        const size = await this.getDirectorySize(packagePath);
+        return this.formatSize(size);
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  private async getNodePackageLastUpdated(packageName: string): Promise<string> {
+    try {
+      const projectPath = (await this.configManager.getCurrentProject())?.path || process.cwd();
+      const packageJsonPath = path.join(projectPath, 'node_modules', packageName, 'package.json');
+
+      if (await fs.pathExists(packageJsonPath)) {
+        const stats = await fs.stat(packageJsonPath);
+        return this.formatDate(stats.mtime);
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  // Python specific package info
+  private async getPythonPackageSize(packageName: string): Promise<string> {
+    try {
+      // Use pip show to get package info
+      const result = await ProcessUtils.execute('pip', ['show', packageName]);
+      if (result.exitCode === 0) {
+        const lines = result.stdout.split('\n');
+        const locationLine = lines.find(line => line.startsWith('Location:'));
+
+        if (locationLine) {
+          const location = locationLine.split(':')[1].trim();
+          const packagePath = path.join(location, packageName);
+
+          if (await fs.pathExists(packagePath)) {
+            const size = await this.getDirectorySize(packagePath);
+            return this.formatSize(size);
+          }
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  private async getPythonPackageLastUpdated(packageName: string): Promise<string> {
+    try {
+      // Use pip show to get package info
+      const result = await ProcessUtils.execute('pip', ['show', packageName]);
+      if (result.exitCode === 0) {
+        const lines = result.stdout.split('\n');
+        const locationLine = lines.find(line => line.startsWith('Location:'));
+
+        if (locationLine) {
+          const location = locationLine.split(':')[1].trim();
+          const packagePath = path.join(location, packageName);
+
+          if (await fs.pathExists(packagePath)) {
+            const stats = await fs.stat(packagePath);
+            return this.formatDate(stats.mtime);
+          }
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+    return 'Unknown';
+  }
+
+  // Enhanced version comparison with semantic versioning support
   private isVersionOutdated(current: string, latest: string): boolean {
     if (current === latest) return false;
     if (latest === 'latest') return true;
 
     try {
-      const currentParts = current.split('.').map(Number);
-      const latestParts = latest.split('.').map(Number);
+      // Handle semantic versioning
+      const currentVersion = this.parseSemanticVersion(current);
+      const latestVersion = this.parseSemanticVersion(latest);
 
-      for (let i = 0; i < Math.max(currentParts.length, latestParts.length); i++) {
-        const currentPart = currentParts[i] || 0;
-        const latestPart = latestParts[i] || 0;
+      // Compare major.minor.patch
+      if (latestVersion.major > currentVersion.major) return true;
+      if (latestVersion.major < currentVersion.major) return false;
 
-        if (latestPart > currentPart) return true;
-        if (latestPart < currentPart) return false;
-      }
+      if (latestVersion.minor > currentVersion.minor) return true;
+      if (latestVersion.minor < currentVersion.minor) return false;
+
+      if (latestVersion.patch > currentVersion.patch) return true;
+      if (latestVersion.patch < currentVersion.patch) return false;
+
+      // If base versions are equal, check prerelease
+      if (currentVersion.prerelease && !latestVersion.prerelease) return true;
+      if (!currentVersion.prerelease && latestVersion.prerelease) return false;
 
       return false;
     } catch {
+      // Fallback to string comparison
       return current !== latest;
     }
   }
 
-  private isBreakingChange(current: string, latest: string): boolean {
+  private parseSemanticVersion(version: string): {
+    major: number;
+    minor: number;
+    patch: number;
+    prerelease?: string;
+  } {
+    const semverRegex = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?/;
+    const match = version.match(semverRegex);
+
+    if (!match) {
+      throw new Error(`Invalid semantic version: ${version}`);
+    }
+
+    return {
+      major: parseInt(match[1], 10),
+      minor: parseInt(match[2], 10),
+      patch: parseInt(match[3], 10),
+      prerelease: match[4],
+    };
+  }
+
+  // Utility methods
+  private async getDirectorySize(dirPath: string): Promise<number> {
     try {
-      const currentMajor = parseInt(current.split('.')[0], 10);
-      const latestMajor = parseInt(latest.split('.')[0], 10);
-      return latestMajor > currentMajor;
+      let totalSize = 0;
+      const files = await fs.readdir(dirPath);
+
+      for (const file of files) {
+        const filePath = path.join(dirPath, file);
+        const stats = await fs.stat(filePath);
+
+        if (stats.isDirectory()) {
+          totalSize += await this.getDirectorySize(filePath);
+        } else {
+          totalSize += stats.size;
+        }
+      }
+
+      return totalSize;
     } catch {
-      return false;
+      return 0;
     }
   }
 
-  private async buildDependencyTree(packageManager: PackageManager): Promise<any> {
-    try {
-      const status = await packageManager.getPackageStatus();
-      const tree: any = {};
+  private formatSize(bytes: number): string {
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    if (bytes === 0) return '0 B';
 
-      // Build a simple tree structure
-      status.runtimes.forEach((runtime: any) => {
-        tree[`${runtime.name}@${runtime.version}`] = {
-          [`${runtime.name}-tools`]: 'system',
-        };
-      });
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const size = bytes / Math.pow(1024, i);
 
-      status.services.forEach((service: any) => {
-        tree[`${service.name}@${service.version}`] = {
-          docker: 'system',
-        };
-      });
+    return `${size.toFixed(1)} ${sizes[i]}`;
+  }
 
-      status.dependencies.forEach((dep: any) => {
-        if (dep.runtime) {
-          if (!tree[`${dep.runtime}-packages`]) {
-            tree[`${dep.runtime}-packages`] = {};
-          }
-          tree[`${dep.runtime}-packages`][`${dep.name}@${dep.version}`] = 'dependency';
-        }
-      });
+  private formatDate(date: Date): string {
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
 
-      return tree;
-    } catch {
-      return {};
+    if (diffDays === 0) {
+      return 'Today';
+    } else if (diffDays === 1) {
+      return 'Yesterday';
+    } else if (diffDays < 7) {
+      return `${diffDays} days ago`;
+    } else if (diffDays < 30) {
+      const weeks = Math.floor(diffDays / 7);
+      return `${weeks} week${weeks > 1 ? 's' : ''} ago`;
+    } else if (diffDays < 365) {
+      const months = Math.floor(diffDays / 30);
+      return `${months} month${months > 1 ? 's' : ''} ago`;
+    } else {
+      const years = Math.floor(diffDays / 365);
+      return `${years} year${years > 1 ? 's' : ''} ago`;
     }
+  }
+
+  private async buildDependencyTree(packageManager: PackageManager): Promise<DependencyTreeNode> {
+    const status = await packageManager.getPackageStatus();
+    const tree: DependencyTreeNode = {
+      name: 'project',
+      dependencies: [],
+    };
+
+    // Add runtimes as top-level dependencies
+    status.runtimes.forEach(runtime => {
+      tree.dependencies!.push({
+        name: runtime.name,
+        version: runtime.version,
+        dependencies: [],
+      });
+    });
+
+    // Add services
+    status.services.forEach(service => {
+      tree.dependencies!.push({
+        name: service.name,
+        version: service.version,
+        dependencies: [],
+      });
+    });
+
+    // Add dependencies grouped by runtime
+    status.dependencies.forEach(dep => {
+      const runtimeNode = tree.dependencies!.find(node => node.name === dep.runtime);
+      if (runtimeNode) {
+        if (!runtimeNode.dependencies) {
+          runtimeNode.dependencies = [];
+        }
+        runtimeNode.dependencies.push({
+          name: dep.name,
+          version: dep.version,
+        });
+      }
+    });
+
+    return tree;
   }
 
   private getTypeIcon(type: string): string {
@@ -572,5 +1136,14 @@ export default class Packages extends Command {
     this.log(
       chalk.gray(`💡 Use ${chalk.white('--force')} to update packages with breaking changes`)
     );
+  }
+
+  // TODO: Will be needed for analyzing semantic version breaking changes
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  // @ts-expect-error - Method reserved for future use
+  private _isBreakingChange(_currentVersion: string, _newVersion: string): boolean {
+    // This method will be used to detect breaking changes between versions
+    // by analyzing semantic versioning and changelog data
+    return false;
   }
 }

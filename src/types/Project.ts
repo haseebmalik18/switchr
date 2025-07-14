@@ -15,7 +15,7 @@ export interface ServiceDefinition {
   healthCheck?: string;
   dependencies?: string[];
   autoRestart?: boolean;
-  config?: Record<string, any>; // Template-specific configuration
+  config?: Record<string, unknown>; // Template-specific configuration
 }
 
 export interface Service extends ServiceDefinition {
@@ -39,7 +39,8 @@ export interface RuntimeDefinition {
 export interface DependencyDefinition {
   name: string;
   version?: string;
-  runtime?: string; // Which runtime this belongs to
+  type: 'dependency'; // Add required type field
+  runtime: string; // Make runtime required to match DependencyPackage
   dev?: boolean; // Development dependency
   optional?: boolean; // Optional dependency
   global?: boolean; // Install globally
@@ -48,9 +49,10 @@ export interface DependencyDefinition {
 
 export interface ServicePackageDefinition {
   name: string;
+  type: 'service'; // Add required type field
   template: string; // Template name (postgresql, redis, mongodb, etc.)
   version?: string; // Template version
-  config?: Record<string, any>; // Service-specific configuration
+  config?: Record<string, unknown>; // Service-specific configuration
   description?: string;
 }
 
@@ -117,7 +119,7 @@ export interface LockFile {
     {
       template: string;
       version: string;
-      config: Record<string, any>;
+      config: Record<string, unknown>;
       image?: string;
       digest?: string;
       ports?: number[];

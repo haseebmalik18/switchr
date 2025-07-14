@@ -124,7 +124,7 @@ export class NPMRegistry {
         throw new Error(`NPM search failed: ${response.status} ${response.statusText}`);
       }
 
-      const data: NPMSearchResponse = await response.json();
+      const data = (await response.json()) as NPMSearchResponse;
       this.requestCount++;
 
       return data.objects.map(obj => this.transformSearchResult(obj));
@@ -159,7 +159,7 @@ export class NPMRegistry {
         throw new Error(`NPM package info failed: ${response.status} ${response.statusText}`);
       }
 
-      const data: NPMPackageResponse = await response.json();
+      const data = (await response.json()) as NPMPackageResponse;
       this.requestCount++;
 
       return this.transformPackageInfo(data, version);
@@ -184,7 +184,7 @@ export class NPMRegistry {
 
       if (!response.ok) return [];
 
-      const data: NPMPackageResponse = await response.json();
+      const data = (await response.json()) as NPMPackageResponse;
       this.requestCount++;
 
       return Object.keys(data.versions).sort((a, b) => {
@@ -210,7 +210,7 @@ export class NPMRegistry {
 
       if (!response.ok) return null;
 
-      const data: NPMPackageResponse = await response.json();
+      const data = (await response.json()) as NPMPackageResponse;
       return data['dist-tags']?.latest || null;
     } catch (error) {
       logger.error(`Failed to get latest version for ${packageName}`, error);
@@ -240,7 +240,7 @@ export class NPMRegistry {
         throw new Error(`NPM download stats failed: ${response.status} ${response.statusText}`);
       }
 
-      const data = await response.json();
+      const data = (await response.json()) as { downloads?: number };
       this.requestCount++;
 
       return data.downloads || 0;
@@ -291,8 +291,8 @@ export class NPMRegistry {
       result.homepage = pkg.links.homepage;
     }
 
-    if (pkg.maintainers?.length) {
-      result.maintainers = pkg.maintainers.map(m => m.username || m.name);
+    if (pkg.maintainers) {
+      result.maintainers = pkg.maintainers.map(m => m.username);
     }
 
     return result;

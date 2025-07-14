@@ -1,11 +1,24 @@
 // src/commands/shell.ts - Production-quality shell command
 import { Command, Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
+import { spawn } from 'child_process';
+import * as fs from 'fs-extra';
+import * as path from 'path';
 import { ConfigManager } from '../core/ConfigManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
-import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
+import { ProjectProfile } from '../types/Project';
 import { RuntimeType } from '../types/Runtime';
+
+interface ShellCommandFlags {
+  service: string | undefined;
+  clean: boolean;
+  'export-env': string | undefined;
+  command: string | undefined;
+  runtime: string | undefined;
+  'print-env': boolean;
+  shell: string | undefined;
+}
 
 export default class Shell extends Command {
   static override description = 'Enter a shell with the project environment loaded';
@@ -96,110 +109,109 @@ export default class Shell extends Command {
   }
 
   private async buildProjectEnvironment(
-    currentProject: any,
-    flags: any
+    currentProject: ProjectProfile,
+    flags: ShellCommandFlags
   ): Promise<Record<string, string>> {
     logger.debug('Building project environment...');
 
     // Start with base environment (or clean if requested)
-    let environment = flags.clean
+    const environment = flags.clean
       ? this.getMinimalEnvironment()
-      : ProcessUtils.getEnvironmentVariables();
+      : ({ ...process.env } as Record<string, string>);
 
     // Add project environment variables
     if (currentProject.environment) {
-      environment = { ...environment, ...currentProject.environment };
+      Object.assign(environment, currentProject.environment);
     }
 
-    // Add runtime-specific environment
+    // Add runtime environments
     await this.addRuntimeEnvironment(environment, currentProject, flags);
 
-    // Add service-specific environment
+    // Add service-specific environment if specified
     if (flags.service) {
       await this.addServiceEnvironment(environment, currentProject, flags.service);
     }
 
-    // Add switchr-specific environment variables
-    environment = {
-      ...environment,
-      SWITCHR_PROJECT: currentProject.name,
-      SWITCHR_PROJECT_PATH: currentProject.path,
-      SWITCHR_ACTIVE: 'true',
-    };
-
-    // Add project paths to PATH
+    // Build project paths
+    environment.PROJECT_PATH = currentProject.path;
+    environment.PROJECT_NAME = currentProject.name;
     environment.PATH = this.buildProjectPaths(currentProject, environment.PATH || '');
 
-    logger.debug(`Built environment with ${Object.keys(environment).length} variables`);
     return environment;
   }
 
   private async addRuntimeEnvironment(
     environment: Record<string, string>,
-    currentProject: any,
-    flags: any
+    currentProject: ProjectProfile,
+    flags: ShellCommandFlags
   ): Promise<void> {
-    // Initialize runtime registry
-    await RuntimeRegistry.initialize();
+    const runtimes = await this.determineRuntimes(currentProject, flags);
 
-    // Determine which runtimes to load
-    const runtimesToLoad = await this.determineRuntimes(currentProject, flags);
-
-    for (const runtimeType of runtimesToLoad) {
+    for (const runtimeType of runtimes) {
       try {
-        logger.debug(`Loading runtime environment: ${runtimeType}`);
+        // Initialize runtime registry if needed
+        await RuntimeRegistry.initialize();
 
-        const manager = RuntimeRegistry.create(runtimeType, currentProject.path, '/tmp');
+        // Create runtime manager instance to get environment
+        const manager = RuntimeRegistry.create(
+          runtimeType,
+          currentProject.path,
+          this.getCacheDir()
+        );
         const runtimeEnv = await manager.getEnvironmentVars();
 
         // Merge runtime environment
         Object.assign(environment, runtimeEnv);
 
-        logger.debug(
-          `Added ${Object.keys(runtimeEnv).length} variables from ${runtimeType} runtime`
-        );
+        logger.debug(`Added environment variables from ${runtimeType} runtime`);
       } catch (error) {
-        logger.warn(`Failed to load ${runtimeType} runtime environment`, error);
+        logger.warn(`Failed to load runtime environment for ${runtimeType}:`, error);
       }
     }
   }
 
-  private async determineRuntimes(currentProject: any, flags: any): Promise<RuntimeType[]> {
-    const runtimes: RuntimeType[] = [];
-
-    // Explicit runtime from flags
+  private async determineRuntimes(
+    currentProject: ProjectProfile,
+    flags: ShellCommandFlags
+  ): Promise<RuntimeType[]> {
+    // If specific runtime is requested via flags
     if (flags.runtime && RuntimeRegistry.isSupported(flags.runtime)) {
-      runtimes.push(flags.runtime as RuntimeType);
-      return runtimes;
+      return [flags.runtime as RuntimeType];
     }
 
-    // Runtimes from project packages
+    // Auto-detect from project
+    const detectedRuntimes: RuntimeType[] = [];
+
+    // Check project packages for runtimes
     if (currentProject.packages?.runtimes) {
-      for (const runtimeName of Object.keys(currentProject.packages.runtimes)) {
-        if (RuntimeRegistry.isSupported(runtimeName)) {
-          runtimes.push(runtimeName as RuntimeType);
+      Object.keys(currentProject.packages.runtimes).forEach(runtime => {
+        if (RuntimeRegistry.isSupported(runtime as RuntimeType)) {
+          detectedRuntimes.push(runtime as RuntimeType);
         }
-      }
+      });
     }
 
-    // Auto-detect runtimes if none specified
-    if (runtimes.length === 0) {
-      const detectedRuntimes = await RuntimeRegistry.detectProjectRuntime(currentProject.path);
-      runtimes.push(...detectedRuntimes);
+    // Fallback to project tools
+    if (detectedRuntimes.length === 0 && currentProject.tools) {
+      Object.keys(currentProject.tools).forEach(tool => {
+        if (RuntimeRegistry.isSupported(tool as RuntimeType)) {
+          detectedRuntimes.push(tool as RuntimeType);
+        }
+      });
     }
 
-    return runtimes;
+    return detectedRuntimes;
   }
 
   private async addServiceEnvironment(
     environment: Record<string, string>,
-    currentProject: any,
+    currentProject: ProjectProfile,
     serviceName: string
   ): Promise<void> {
-    const service = currentProject.services.find((s: any) => s.name === serviceName);
-
+    const service = currentProject.services.find(s => s.name === serviceName);
     if (!service) {
-      throw new Error(`Service '${serviceName}' not found in project`);
+      logger.warn(`Service '${serviceName}' not found in project`);
+      return;
     }
 
     // Add service-specific environment variables
@@ -207,37 +219,34 @@ export default class Shell extends Command {
       Object.assign(environment, service.environment);
     }
 
-    // Add service context variables
-    environment.SWITCHR_SERVICE = service.name;
-    if (service.port) {
-      environment.SWITCHR_SERVICE_PORT = service.port.toString();
+    // Add service working directory if specified
+    if (service.workingDirectory) {
+      environment.SERVICE_WORKING_DIR = path.resolve(currentProject.path, service.workingDirectory);
     }
 
-    logger.debug(`Added environment for service: ${serviceName}`);
+    // Add service port if specified
+    if (service.port) {
+      environment.SERVICE_PORT = service.port.toString();
+    }
   }
 
-  private buildProjectPaths(currentProject: any, currentPath: string): string {
-    const projectPaths: string[] = [];
+  private buildProjectPaths(currentProject: ProjectProfile, currentPath: string): string {
+    const projectPaths = [
+      path.join(currentProject.path, 'node_modules', '.bin'),
+      path.join(currentProject.path, 'bin'),
+      path.join(currentProject.path, 'scripts'),
+    ];
 
-    // Add project root
-    projectPaths.push(currentProject.path);
+    // Filter existing paths
+    const existingPaths = projectPaths.filter(p => {
+      try {
+        return fs.existsSync(p);
+      } catch {
+        return false;
+      }
+    });
 
-    // Add common project directories
-    const commonDirs = ['bin', 'scripts', 'node_modules/.bin', '.venv/bin', 'vendor/bin'];
-
-    for (const dir of commonDirs) {
-      const fullPath = `${currentProject.path}/${dir}`;
-      projectPaths.push(fullPath);
-    }
-
-    // Add switchr bin directory
-    projectPaths.push(`${currentProject.path}/.switchr/bin`);
-
-    // Combine with existing PATH, removing duplicates
-    const allPaths = [...projectPaths, ...currentPath.split(':')];
-    const uniquePaths = Array.from(new Set(allPaths)).filter(Boolean);
-
-    return uniquePaths.join(':');
+    return [...existingPaths, currentPath].join(':');
   }
 
   private getMinimalEnvironment(): Record<string, string> {
@@ -254,104 +263,66 @@ export default class Shell extends Command {
   private async runCommand(
     command: string,
     environment: Record<string, string>,
-    flags: any
+    flags: ShellCommandFlags
   ): Promise<void> {
-    this.log(chalk.blue(`🔧 Running: ${chalk.bold(command)}`));
+    logger.debug(`Running command: ${command}`);
 
-    try {
-      const { command: cmd, args } = ProcessUtils.parseCommand(command);
+    const shell = this.determineShell(flags);
+    const child = spawn(shell, ['-c', command], {
+      stdio: 'inherit',
+      env: environment,
+      cwd: environment.PROJECT_PATH,
+    });
 
-      const result = await ProcessUtils.execute(cmd, args, {
-        env: environment,
-        cwd: process.cwd(),
-        stdio: 'inherit',
+    return new Promise((resolve, reject) => {
+      child.on('close', code => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Command exited with code ${code}`));
+        }
       });
 
-      if (result.exitCode !== 0) {
-        this.error(`Command failed with exit code ${result.exitCode}`);
-      }
-
-      this.log(chalk.green('✅ Command completed successfully'));
-    } catch (error) {
-      logger.error('Command execution failed', error);
-      this.error(`Command failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
+      child.on('error', reject);
+    });
   }
 
   private async startInteractiveShell(
     environment: Record<string, string>,
-    flags: any,
+    flags: ShellCommandFlags,
     projectName: string
   ): Promise<void> {
     const shell = this.determineShell(flags);
+    const promptIndicator = `(${projectName})`;
 
-    // Create a custom prompt indicator
-    const promptIndicator = `(switchr:${projectName})`;
-
-    // Set up shell-specific prompt
+    // Setup shell prompt
     this.setupShellPrompt(environment, shell, promptIndicator);
 
-    this.log(chalk.blue(`🐚 Starting ${shell} with project environment...`));
-    this.log(chalk.gray(`   Project: ${projectName}`));
-    this.log(chalk.gray(`   Use ${chalk.white('exit')} or ${chalk.white('Ctrl+D')} to return`));
-    this.log('');
+    logger.debug(`Starting ${shell} with project environment`);
 
-    try {
-      // Start the shell with the environment
-      const child = ProcessUtils.spawn(shell, [], {
-        env: environment,
-        cwd: process.cwd(),
-        stdio: 'inherit',
+    const child = spawn(shell, [], {
+      stdio: 'inherit',
+      env: environment,
+      cwd: environment.PROJECT_PATH,
+    });
+
+    return new Promise((resolve, reject) => {
+      child.on('close', code => {
+        this.log(chalk.blue(`\n👋 Exited project shell (code: ${code})`));
+        resolve();
       });
 
-      // Wait for shell to exit
-      await new Promise<void>((resolve, reject) => {
-        child.on('exit', code => {
-          if (code === 0) {
-            resolve();
-          } else {
-            reject(new Error(`Shell exited with code ${code}`));
-          }
-        });
-
-        child.on('error', error => {
-          reject(error);
-        });
-      });
-
-      this.log(chalk.blue('🐚 Shell session ended'));
-    } catch (error) {
-      logger.error('Shell execution failed', error);
-      this.error(`Shell failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
+      child.on('error', reject);
+    });
   }
 
-  private determineShell(flags: any): string {
-    // Explicit shell from flags
+  private determineShell(flags: ShellCommandFlags): string {
+    // Priority: flag > SHELL env var > default
     if (flags.shell) {
       return flags.shell;
     }
 
-    // Use user's default shell
-    const userShell = process.env.SHELL;
-    if (userShell) {
-      return userShell;
-    }
-
-    // Try to detect available shells
-    const availableShells = ['/bin/zsh', '/bin/bash', '/bin/sh'];
-
-    for (const shell of availableShells) {
-      try {
-        require('fs').accessSync(shell, require('fs').constants.F_OK);
-        return shell;
-      } catch {
-        continue;
-      }
-    }
-
-    // Fallback
-    return '/bin/sh';
+    return process.env.SHELL || '/bin/bash';
   }
 
   private setupShellPrompt(
@@ -412,23 +383,20 @@ export default class Shell extends Command {
     environment: Record<string, string>
   ): Record<string, Array<{ key: string; value: string }>> {
     const groups: Record<string, Array<{ key: string; value: string }>> = {
-      switchr: [],
       runtime: [],
       project: [],
       system: [],
     };
 
     for (const [key, value] of Object.entries(environment)) {
-      const keyLower = key.toLowerCase();
+      const maskedValue = this.maskSensitiveValue(key, value);
 
-      if (key.startsWith('SWITCHR_')) {
-        groups.switchr.push({ key, value });
-      } else if (this.isRuntimeVariable(key)) {
-        groups.runtime.push({ key, value });
+      if (this.isRuntimeVariable(key)) {
+        groups.runtime.push({ key, value: maskedValue });
       } else if (this.isProjectVariable(key)) {
-        groups.project.push({ key, value });
+        groups.project.push({ key, value: maskedValue });
       } else {
-        groups.system.push({ key, value });
+        groups.system.push({ key, value: maskedValue });
       }
     }
 
@@ -473,28 +441,10 @@ export default class Shell extends Command {
   }
 
   private maskSensitiveValue(key: string, value: string): string {
-    const sensitivePatterns = [
-      'password',
-      'secret',
-      'key',
-      'token',
-      'auth',
-      'credential',
-      'private',
-      'cert',
-      'ssl',
-      'tls',
-    ];
+    const sensitiveKeys = ['password', 'secret', 'key', 'token', 'api', 'auth'];
 
-    const isSensitive = sensitivePatterns.some(pattern => key.toLowerCase().includes(pattern));
-
-    if (isSensitive && value.length > 3) {
-      return value.substring(0, 3) + '*'.repeat(Math.min(value.length - 3, 8));
-    }
-
-    // Truncate very long values
-    if (value.length > 100) {
-      return value.substring(0, 97) + '...';
+    if (sensitiveKeys.some(keyword => key.toLowerCase().includes(keyword))) {
+      return value.length > 0 ? '*'.repeat(Math.min(value.length, 8)) : '';
     }
 
     return value;
@@ -525,7 +475,6 @@ export default class Shell extends Command {
           content = this.generateShellExport(environment);
       }
 
-      const fs = await import('fs-extra');
       await fs.writeFile(filePath, content, 'utf8');
 
       this.log(chalk.green(`✅ Environment exported to: ${filePath}`));
@@ -605,5 +554,10 @@ export default class Shell extends Command {
     }
 
     return content;
+  }
+
+  private getCacheDir(): string {
+    const configManager = ConfigManager.getInstance();
+    return configManager.getConfigDir();
   }
 }

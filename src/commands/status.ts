@@ -1,85 +1,211 @@
+// src/commands/status.ts - Complete production implementation with strong typing
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
+import ora from 'ora';
 import { ConfigManager } from '../core/ConfigManager';
+import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
+import { ProjectProfile, Service } from '../types/Project';
+import { RuntimeType } from '../types/Runtime';
 
 interface ServiceStatus {
   name: string;
-  status: 'running' | 'stopped' | 'unknown';
+  status: 'running' | 'stopped' | 'error' | 'unknown';
   pid?: number;
   port?: number;
-  uptime?: string;
   memory?: string;
   cpu?: string;
+  uptime?: string;
+  template?: string;
+  command?: string;
+}
+
+interface RuntimeStatus {
+  name: string;
+  version: string;
+  installed: boolean;
+  active: boolean;
+  path?: string;
+  manager?: string;
+}
+
+interface ProjectStatus {
+  project: ProjectProfile;
+  runtimes: RuntimeStatus[];
+  services: ServiceStatus[];
+  totalServices: number;
+  runningServices: number;
+  errorServices: number;
+}
+
+interface StatusCommandFlags {
+  detailed: boolean;
+  json: boolean;
+  watch: boolean;
+  services: string | undefined;
 }
 
 export default class Status extends Command {
-  static override description = 'Show current project status and running services';
+  static override description = 'Show project and service status';
 
   static override examples = [
     '<%= config.bin %> <%= command.id %>',
-    '<%= config.bin %> <%= command.id %> --verbose',
+    '<%= config.bin %> <%= command.id %> --detailed',
     '<%= config.bin %> <%= command.id %> --json',
+    '<%= config.bin %> <%= command.id %> --services redis,postgres',
+    '<%= config.bin %> <%= command.id %> --watch',
   ];
 
   static override flags = {
-    verbose: Flags.boolean({
-      char: 'v',
+    detailed: Flags.boolean({
+      char: 'd',
       description: 'Show detailed service information',
       default: false,
     }),
     json: Flags.boolean({
+      char: 'j',
       description: 'Output in JSON format',
       default: false,
     }),
-    services: Flags.boolean({
-      char: 's',
-      description: 'Show only service status',
+    watch: Flags.boolean({
+      char: 'w',
+      description: 'Watch for changes and update status',
       default: false,
     }),
+    services: Flags.string({
+      char: 's',
+      description: 'Filter by specific services (comma-separated)',
+    }),
   };
+
+  private configManager: ConfigManager;
+
+  constructor(argv: string[], config: import('@oclif/core').Config) {
+    super(argv, config);
+    this.configManager = ConfigManager.getInstance();
+  }
 
   public async run(): Promise<void> {
     const { flags } = await this.parse(Status);
 
     try {
-      const configManager = ConfigManager.getInstance();
-      const currentProject = await configManager.getCurrentProject();
+      // Initialize runtime registry
+      await RuntimeRegistry.initialize();
 
+      const currentProject = await this.configManager.getCurrentProject();
       if (!currentProject) {
-        this.log(chalk.yellow('📋 No active project'));
-        this.log(
-          chalk.gray(`   Run ${chalk.white('switchr switch <project-name>')} to activate a project`)
-        );
-        return;
+        this.error('No active project. Run switchr switch <project-name> to activate a project.');
       }
 
-      const serviceStatuses = await this.getServiceStatuses(currentProject.services);
-
-      if (flags.json) {
-        this.outputJson(currentProject, serviceStatuses);
+      if (flags.watch) {
+        await this.watchStatus(currentProject, flags);
       } else {
-        await this.outputStatus(currentProject, serviceStatuses, flags);
+        await this.showStatus(currentProject, flags);
       }
     } catch (error) {
-      logger.error('Failed to get project status', error);
+      logger.error('Failed to get status', error);
       this.error(error instanceof Error ? error.message : 'Unknown error occurred');
     }
   }
 
-  private async getServiceStatuses(services: any[]): Promise<ServiceStatus[]> {
-    const statuses: ServiceStatus[] = [];
+  private async showStatus(project: ProjectProfile, flags: StatusCommandFlags): Promise<void> {
+    const spinner = ora('Gathering status information...').start();
 
-    for (const service of services) {
+    try {
+      const projectStatus = await this.getProjectStatus(project, flags);
+      spinner.stop();
+
+      if (flags.json) {
+        this.outputJson(projectStatus);
+        return;
+      }
+
+      this.displayStatus(projectStatus, flags);
+    } catch (error) {
+      spinner.fail('Failed to gather status information');
+      throw error;
+    }
+  }
+
+  private async getProjectStatus(
+    project: ProjectProfile,
+    flags: StatusCommandFlags
+  ): Promise<ProjectStatus> {
+    const [runtimeStatuses, serviceStatuses] = await Promise.all([
+      this.getRuntimeStatuses(project),
+      this.getServiceStatuses(project.services, flags),
+    ]);
+
+    return {
+      project,
+      runtimes: runtimeStatuses,
+      services: serviceStatuses,
+      totalServices: serviceStatuses.length,
+      runningServices: serviceStatuses.filter(s => s.status === 'running').length,
+      errorServices: serviceStatuses.filter(s => s.status === 'error').length,
+    };
+  }
+
+  private async getRuntimeStatuses(project: ProjectProfile): Promise<RuntimeStatus[]> {
+    const statuses: RuntimeStatus[] = [];
+
+    // Get runtime info from project tools and packages
+    const runtimeConfigs = new Map<string, string>();
+
+    // Check project tools (legacy)
+    if (project.tools) {
+      Object.entries(project.tools).forEach(([tool, version]) => {
+        if (['node', 'nodejs', 'python', 'go', 'java', 'rust'].includes(tool)) {
+          runtimeConfigs.set(tool === 'node' ? 'nodejs' : tool, version);
+        }
+      });
+    }
+
+    // Check project packages (new format)
+    if (project.packages?.runtimes) {
+      Object.entries(project.packages.runtimes).forEach(([runtime, version]) => {
+        runtimeConfigs.set(runtime, version);
+      });
+    }
+
+    // Get status for each runtime
+    for (const [runtimeName, version] of runtimeConfigs) {
       try {
-        const status = await this.checkServiceStatus(service);
-        statuses.push(status);
+        if (RuntimeRegistry.isSupported(runtimeName)) {
+          const manager = RuntimeRegistry.create(
+            runtimeName as RuntimeType,
+            project.path,
+            this.configManager.getConfigDir()
+          );
+
+          const currentEnv = await manager.getCurrentVersion();
+          const isInstalled = await manager.isInstalled(version);
+          const bestManager = await manager.getBestManager();
+
+          statuses.push({
+            name: runtimeName,
+            version,
+            installed: isInstalled,
+            active: currentEnv?.version === version,
+            ...(currentEnv?.path && { path: currentEnv.path }),
+            ...(bestManager?.name && { manager: bestManager.name }),
+          });
+        } else {
+          statuses.push({
+            name: runtimeName,
+            version,
+            installed: false,
+            active: false,
+          });
+        }
       } catch (error) {
-        logger.debug(`Failed to check status for service ${service.name}`, error);
+        logger.debug(`Failed to get status for runtime ${runtimeName}:`, error);
         statuses.push({
-          name: service.name,
-          status: 'unknown',
+          name: runtimeName,
+          version,
+          installed: false,
+          active: false,
         });
       }
     }
@@ -87,185 +213,304 @@ export default class Status extends Command {
     return statuses;
   }
 
-  private async checkServiceStatus(service: any): Promise<ServiceStatus> {
-    const status: ServiceStatus = {
-      name: service.name,
-      status: 'stopped',
-    };
+  private async getServiceStatuses(
+    services: Service[],
+    flags: StatusCommandFlags
+  ): Promise<ServiceStatus[]> {
+    const filteredServices = this.filterServices(services, flags);
+    const statuses = await Promise.all(
+      filteredServices.map(service => this.checkServiceStatus(service))
+    );
 
-    if (service.port) {
-      const isPortBusy = !(await ProcessUtils.isPortAvailable(service.port));
-      if (isPortBusy) {
-        status.status = 'running';
-        status.port = service.port;
-
-        const pid = await ProcessUtils.findProcessByPort(service.port);
-        if (pid) {
-          status.pid = pid;
-
-          const processInfo = await this.getProcessInfo(pid);
-          if (processInfo) {
-            status.uptime = processInfo.uptime;
-            status.memory = processInfo.memory;
-            status.cpu = processInfo.cpu;
-          }
-        }
-      }
-    } else {
-      const isRunning = await this.isProcessRunningByCommand(service.command);
-      status.status = isRunning ? 'running' : 'stopped';
-    }
-
-    return status;
+    return statuses;
   }
 
-  private async isProcessRunningByCommand(command: string): Promise<boolean> {
-    try {
-      const isWindows = process.platform === 'win32';
+  private filterServices(services: Service[], flags: StatusCommandFlags): Service[] {
+    if (!flags.services) {
+      return services;
+    }
 
-      if (isWindows) {
-        const result = await ProcessUtils.execute('tasklist', ['/fo', 'csv']);
-        return result.stdout.toLowerCase().includes(command.toLowerCase());
-      } else {
-        const result = await ProcessUtils.execute('pgrep', ['-f', command]);
-        return result.exitCode === 0 && result.stdout.trim().length > 0;
+    const requestedServices = flags.services.split(',').map(s => s.trim().toLowerCase());
+    return services.filter(service => requestedServices.includes(service.name.toLowerCase()));
+  }
+
+  private async checkServiceStatus(service: Service): Promise<ServiceStatus> {
+    try {
+      // Check if service is running via PM2
+      const pm2Status = await this.checkPM2Status(service.name);
+      if (pm2Status) {
+        return {
+          name: service.name,
+          status: 'running',
+          pid: pm2Status.pid,
+          memory: pm2Status.memory,
+          cpu: pm2Status.cpu,
+          uptime: pm2Status.uptime,
+          ...(service.template && { template: service.template }),
+          ...(service.command && { command: service.command }),
+          ...(service.port && { port: service.port }),
+        };
       }
+
+      // Check if service is running via Docker
+      const dockerStatus = await this.checkDockerStatus(service.name);
+      if (dockerStatus) {
+        return {
+          name: service.name,
+          status: 'running',
+          memory: dockerStatus.memory,
+          uptime: dockerStatus.uptime,
+          ...(service.template && { template: service.template }),
+          ...(service.command && { command: service.command }),
+          ...(service.port && { port: service.port }),
+        };
+      }
+
+      // Check if service is listening on port
+      if (service.port) {
+        const isListening = await this.checkPortStatus(service.port);
+        if (isListening) {
+          return {
+            name: service.name,
+            status: 'running',
+            port: service.port,
+            ...(service.template && { template: service.template }),
+            ...(service.command && { command: service.command }),
+          };
+        }
+      }
+
+      return {
+        name: service.name,
+        status: 'stopped',
+        ...(service.template && { template: service.template }),
+        ...(service.command && { command: service.command }),
+        ...(service.port && { port: service.port }),
+      };
+    } catch (error) {
+      logger.debug(`Failed to check status for service ${service.name}:`, error);
+      return {
+        name: service.name,
+        status: 'error',
+        ...(service.template && { template: service.template }),
+        ...(service.command && { command: service.command }),
+        ...(service.port && { port: service.port }),
+      };
+    }
+  }
+
+  private async checkPM2Status(
+    serviceName: string
+  ): Promise<{ pid: number; memory: string; cpu: string; uptime: string } | null> {
+    try {
+      const result = await ProcessUtils.execute('pm2', ['jlist']);
+      if (result.exitCode !== 0) return null;
+
+      const processes = JSON.parse(result.stdout);
+      const process = processes.find(
+        (p: { name: string; pm2_env?: { status?: string } }) => p.name === serviceName
+      );
+
+      if (process && process.pm2_env?.status === 'online') {
+        return {
+          pid: process.pid,
+          memory: this.formatMemory(process.monit?.memory || 0),
+          cpu: `${process.monit?.cpu || 0}%`,
+          uptime: this.formatUptime(process.pm2_env?.pm_uptime || Date.now()),
+        };
+      }
+    } catch {
+      // PM2 not available or service not found
+    }
+    return null;
+  }
+
+  private async checkDockerStatus(
+    serviceName: string
+  ): Promise<{ memory: string; uptime: string } | null> {
+    try {
+      const result = await ProcessUtils.execute('docker', [
+        'stats',
+        '--no-stream',
+        '--format',
+        'table {{.Container}}\t{{.MemUsage}}\t{{.CPUPerc}}',
+        serviceName,
+      ]);
+
+      if (result.exitCode === 0 && result.stdout.trim()) {
+        const lines = result.stdout.trim().split('\n');
+        if (lines.length > 1) {
+          const [, memory] = lines[1].split('\t');
+
+          // Get container creation time for uptime
+          const inspectResult = await ProcessUtils.execute('docker', [
+            'inspect',
+            '--format',
+            '{{.State.StartedAt}}',
+            serviceName,
+          ]);
+
+          const uptime =
+            inspectResult.exitCode === 0
+              ? this.formatUptime(new Date(inspectResult.stdout.trim()).getTime())
+              : 'Unknown';
+
+          return { memory, uptime };
+        }
+      }
+    } catch {
+      // Docker not available or service not found
+    }
+    return null;
+  }
+
+  private async checkPortStatus(port: number): Promise<boolean> {
+    try {
+      const result = await ProcessUtils.execute('lsof', ['-i', `:${port}`]);
+      return result.exitCode === 0 && result.stdout.includes('LISTEN');
     } catch {
       return false;
     }
   }
 
-  private async getProcessInfo(
-    pid: number
-  ): Promise<{ uptime: string; memory: string; cpu: string } | null> {
-    try {
-      const isWindows = process.platform === 'win32';
+  private displayStatus(projectStatus: ProjectStatus, flags: StatusCommandFlags): void {
+    // Project header
+    this.log(chalk.blue('📊 Project Status\n'));
+    this.log(chalk.blue(`Project: ${chalk.white(projectStatus.project.name)}`));
+    this.log(chalk.gray(`Path: ${projectStatus.project.path}`));
+    this.log(chalk.gray(`Type: ${projectStatus.project.type}`));
+    this.log('');
 
-      if (isWindows) {
-        await ProcessUtils.execute('tasklist', ['/fi', `pid eq ${pid}`, '/fo', 'csv']);
-        return {
-          uptime: 'N/A',
-          memory: 'N/A',
-          cpu: 'N/A',
-        };
-      } else {
-        const result = await ProcessUtils.execute('ps', [
-          '-p',
-          pid.toString(),
-          '-o',
-          'etime,rss,pcpu',
-          '--no-headers',
-        ]);
-        const parts = result.stdout.trim().split(/\s+/);
+    // Runtime status
+    if (projectStatus.runtimes.length > 0) {
+      this.log(chalk.blue('🔧 Runtimes:'));
+      projectStatus.runtimes.forEach(runtime => {
+        const statusIcon = runtime.active
+          ? chalk.green('●')
+          : runtime.installed
+            ? chalk.yellow('●')
+            : chalk.red('●');
+        const statusText = runtime.active
+          ? 'active'
+          : runtime.installed
+            ? 'installed'
+            : 'not installed';
 
-        if (parts.length >= 3) {
-          return {
-            uptime: parts[0] || 'N/A',
-            memory: parts[1] ? `${Math.round(parseInt(parts[1]) / 1024)}MB` : 'N/A',
-            cpu: parts[2] ? `${parts[2]}%` : 'N/A',
-          };
+        this.log(
+          `   ${statusIcon} ${chalk.white(runtime.name)} ${chalk.gray(`v${runtime.version}`)} ${chalk.gray(`(${statusText})`)}`
+        );
+
+        if (flags.detailed && runtime.manager) {
+          this.log(chalk.gray(`     Manager: ${runtime.manager}`));
         }
-      }
-    } catch (error) {
-      logger.debug(`Failed to get process info for PID ${pid}`, error);
-    }
-
-    return null;
-  }
-
-  private outputJson(project: any, serviceStatuses: ServiceStatus[]): void {
-    const output = {
-      project: {
-        name: project.name,
-        type: project.type,
-        path: project.path,
-        description: project.description,
-      },
-      services: serviceStatuses,
-      summary: {
-        total: serviceStatuses.length,
-        running: serviceStatuses.filter(s => s.status === 'running').length,
-        stopped: serviceStatuses.filter(s => s.status === 'stopped').length,
-        unknown: serviceStatuses.filter(s => s.status === 'unknown').length,
-      },
-    };
-
-    this.log(JSON.stringify(output, null, 2));
-  }
-
-  private async outputStatus(
-    project: any,
-    serviceStatuses: ServiceStatus[],
-    flags: any
-  ): Promise<void> {
-    if (!flags.services) {
-      this.log(chalk.blue(`📋 Project: ${chalk.bold(project.name)}`));
-      this.log(chalk.gray(`   Type: ${project.type}`));
-      this.log(chalk.gray(`   Path: ${project.path}`));
-
-      if (project.description) {
-        this.log(chalk.gray(`   Description: ${project.description}`));
-      }
-
+        if (flags.detailed && runtime.path) {
+          this.log(chalk.gray(`     Path: ${runtime.path}`));
+        }
+      });
       this.log('');
     }
 
-    if (serviceStatuses.length === 0) {
-      this.log(chalk.yellow('⚙️  No services configured'));
-      return;
+    // Service status
+    this.log(
+      chalk.blue(
+        `⚡ Services (${projectStatus.runningServices}/${projectStatus.totalServices} running):`
+      )
+    );
+
+    if (projectStatus.services.length === 0) {
+      this.log(chalk.gray('   No services configured'));
+    } else {
+      projectStatus.services.forEach(service => {
+        this.displayServiceStatus(service, flags);
+      });
     }
 
-    const runningCount = serviceStatuses.filter(s => s.status === 'running').length;
-    const totalCount = serviceStatuses.length;
-
-    this.log(chalk.blue(`⚙️  Services (${runningCount}/${totalCount} running):`));
-    this.log('');
-
-    const sortedServices = serviceStatuses.sort((a, b) => {
-      const statusOrder = { running: 0, stopped: 1, unknown: 2 };
-      return statusOrder[a.status] - statusOrder[b.status];
-    });
-
-    for (const service of sortedServices) {
-      this.displayService(service, flags.verbose);
-    }
-
-    this.log('');
-    this.showSummary(serviceStatuses);
+    this.displayStatusFooter(projectStatus);
   }
 
-  private displayService(service: ServiceStatus, verbose: boolean): void {
+  private displayServiceStatus(service: ServiceStatus, flags: StatusCommandFlags): void {
     const statusIcon = this.getStatusIcon(service.status);
     const statusColor = this.getStatusColor(service.status);
 
-    const serviceName = chalk.white(service.name);
-    const statusText = statusColor(service.status.toUpperCase());
+    this.log(`   ${statusIcon} ${chalk.white(service.name)} ${statusColor(service.status)}`);
 
-    this.log(`${statusIcon} ${serviceName} - ${statusText}`);
-
-    if (verbose && service.status === 'running') {
+    if (flags.detailed) {
+      if (service.template) {
+        this.log(chalk.gray(`     Template: ${service.template}`));
+      }
+      if (service.command) {
+        this.log(chalk.gray(`     Command: ${service.command}`));
+      }
       if (service.port) {
-        this.log(chalk.gray(`    📡 Port: ${service.port}`));
+        this.log(chalk.gray(`     Port: ${service.port}`));
       }
-
       if (service.pid) {
-        this.log(chalk.gray(`    🆔 PID: ${service.pid}`));
+        this.log(chalk.gray(`     PID: ${service.pid}`));
       }
-
-      if (service.uptime && service.uptime !== 'N/A') {
-        this.log(chalk.gray(`    ⏱️  Uptime: ${service.uptime}`));
+      if (service.memory) {
+        this.log(chalk.gray(`     Memory: ${service.memory}`));
       }
-
-      if (service.memory && service.memory !== 'N/A') {
-        this.log(chalk.gray(`    💾 Memory: ${service.memory}`));
+      if (service.cpu) {
+        this.log(chalk.gray(`     CPU: ${service.cpu}`));
       }
-
-      if (service.cpu && service.cpu !== 'N/A') {
-        this.log(chalk.gray(`    🔄 CPU: ${service.cpu}`));
+      if (service.uptime) {
+        this.log(chalk.gray(`     Uptime: ${service.uptime}`));
       }
-
-      this.log('');
     }
+  }
+
+  private async watchStatus(project: ProjectProfile, flags: StatusCommandFlags): Promise<void> {
+    this.log(chalk.blue('👀 Watching project status (Press Ctrl+C to stop)...'));
+    this.log('');
+
+    const interval = setInterval(async () => {
+      try {
+        // Clear screen
+        process.stdout.write('\x1B[2J\x1B[0f');
+
+        const projectStatus = await this.getProjectStatus(project, flags);
+        this.displayStatus(projectStatus, flags);
+
+        this.log(chalk.gray(`\nLast updated: ${new Date().toLocaleTimeString()}`));
+      } catch (error) {
+        logger.error('Error during status watch:', error);
+      }
+    }, 3000); // Update every 3 seconds
+
+    // Handle Ctrl+C gracefully
+    process.on('SIGINT', () => {
+      clearInterval(interval);
+      this.log('\n' + chalk.blue('👋 Status monitoring stopped'));
+      process.exit(0);
+    });
+
+    // Show initial status
+    const projectStatus = await this.getProjectStatus(project, flags);
+    this.displayStatus(projectStatus, flags);
+    this.log(chalk.gray(`\nLast updated: ${new Date().toLocaleTimeString()}`));
+  }
+
+  private outputJson(projectStatus: ProjectStatus): void {
+    this.log(JSON.stringify(projectStatus, null, 2));
+  }
+
+  private displayStatusFooter(projectStatus: ProjectStatus): void {
+    this.log('');
+
+    if (projectStatus.runningServices === 0) {
+      this.log(chalk.gray(`💡 Use ${chalk.white('switchr start')} to start services`));
+    } else if (projectStatus.runningServices < projectStatus.totalServices) {
+      this.log(
+        chalk.gray(`💡 Use ${chalk.white('switchr start <service>')} to start specific services`)
+      );
+    }
+
+    if (projectStatus.errorServices > 0) {
+      this.log(chalk.gray(`⚠️  ${projectStatus.errorServices} service(s) have errors`));
+    }
+
+    this.log(chalk.gray(`💡 Use ${chalk.white('switchr status --detailed')} for more information`));
+    this.log(chalk.gray(`💡 Use ${chalk.white('switchr logs <service>')} to view service logs`));
   }
 
   private getStatusIcon(status: string): string {
@@ -273,9 +518,9 @@ export default class Status extends Command {
       case 'running':
         return chalk.green('●');
       case 'stopped':
-        return chalk.red('●');
-      case 'unknown':
         return chalk.yellow('●');
+      case 'error':
+        return chalk.red('●');
       default:
         return chalk.gray('●');
     }
@@ -286,46 +531,39 @@ export default class Status extends Command {
       case 'running':
         return chalk.green;
       case 'stopped':
-        return chalk.red;
-      case 'unknown':
         return chalk.yellow;
+      case 'error':
+        return chalk.red;
       default:
         return chalk.gray;
     }
   }
 
-  private showSummary(serviceStatuses: ServiceStatus[]): void {
-    const summary = {
-      running: serviceStatuses.filter(s => s.status === 'running').length,
-      stopped: serviceStatuses.filter(s => s.status === 'stopped').length,
-      unknown: serviceStatuses.filter(s => s.status === 'unknown').length,
-    };
+  private formatMemory(bytes: number): string {
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    if (bytes === 0) return '0 B';
 
-    const healthPercentage = Math.round((summary.running / serviceStatuses.length) * 100);
-    let healthIcon = '🔴';
-    let healthText = 'Critical';
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    const size = bytes / Math.pow(1024, i);
 
-    if (healthPercentage >= 80) {
-      healthIcon = '🟢';
-      healthText = 'Healthy';
-    } else if (healthPercentage >= 50) {
-      healthIcon = '🟡';
-      healthText = 'Warning';
+    return `${size.toFixed(1)} ${sizes[i]}`;
+  }
+
+  private formatUptime(startTime: number): string {
+    const uptime = Date.now() - startTime;
+    const seconds = Math.floor(uptime / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) {
+      return `${days}d ${hours % 24}h`;
+    } else if (hours > 0) {
+      return `${hours}h ${minutes % 60}m`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`;
+    } else {
+      return `${seconds}s`;
     }
-
-    this.log(chalk.blue('📊 Summary:'));
-    this.log(chalk.gray(`   Health: ${healthIcon} ${healthText} (${healthPercentage}%)`));
-    this.log(chalk.gray(`   Running: ${chalk.green(summary.running)}`));
-    this.log(chalk.gray(`   Stopped: ${chalk.red(summary.stopped)}`));
-
-    if (summary.unknown > 0) {
-      this.log(chalk.gray(`   Unknown: ${chalk.yellow(summary.unknown)}`));
-    }
-
-    this.log('');
-    this.log(chalk.gray('💡 Quick actions:'));
-    this.log(chalk.gray(`   Start services: ${chalk.white('switchr start')}`));
-    this.log(chalk.gray(`   Stop services: ${chalk.white('switchr stop')}`));
-    this.log(chalk.gray(`   Switch project: ${chalk.white('switchr switch <name>')}`));
   }
 }

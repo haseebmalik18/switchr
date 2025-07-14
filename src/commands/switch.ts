@@ -7,6 +7,7 @@ import { ProcessUtils } from '../utils/ProcessUtils';
 import { logger } from '../utils/Logger';
 import { ProjectProfile, Service } from '../types/Project';
 import { ServiceDependencyResolver } from '../core/ServiceDependencyResolver';
+import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 
 interface RunningService {
   name: string;
@@ -20,6 +21,14 @@ interface ServiceStartResult {
   success: boolean;
   error?: string;
   phase?: number;
+}
+
+interface SwitchCommandFlags {
+  force: boolean;
+  'no-stop': boolean;
+  'no-start': boolean;
+  'dry-run': boolean;
+  timeout: number;
 }
 
 export default class Switch extends Command {
@@ -111,7 +120,7 @@ export default class Switch extends Command {
   private async showDryRun(
     currentProject: ProjectProfile | null,
     targetProject: ProjectProfile,
-    flags: any
+    flags: SwitchCommandFlags
   ): Promise<void> {
     this.log(chalk.yellow('🧪 Dry run - showing what would be executed:\n'));
 
@@ -158,7 +167,7 @@ export default class Switch extends Command {
   private async executeSwitch(
     currentProject: ProjectProfile | null,
     targetProject: ProjectProfile,
-    flags: any
+    flags: SwitchCommandFlags
   ): Promise<void> {
     // Step 1: Stop current services
     if (currentProject && !flags['no-stop']) {
@@ -533,14 +542,39 @@ export default class Switch extends Command {
     }
 
     if (service.template) {
-      // TODO: Generate command from service template
-      // This would integrate with your ServiceTemplateRegistry
-      throw new Error(
-        `Service template '${service.template}' not yet implemented for command generation`
-      );
+      // Generate command from service template
+      try {
+        const template = ServiceTemplateRegistry.getTemplate(service.template);
+        if (!template) {
+          throw new Error(`Service template '${service.template}' not found`);
+        }
+
+        // Use the template's getCommand method with service config
+        const config = service.config || {};
+        const command = template.getCommand(config);
+
+        // Replace any additional placeholders that might not be handled by the template
+        let finalCommand = command;
+
+        // Replace service-specific placeholders
+        if (service.port) {
+          finalCommand = finalCommand.replace(/{{port}}/g, service.port.toString());
+        }
+
+        if (service.name) {
+          finalCommand = finalCommand.replace(/{{name}}/g, service.name);
+        }
+
+        return finalCommand;
+      } catch (error) {
+        logger.error(`Failed to generate command from template '${service.template}':`, error);
+        throw new Error(
+          `Failed to generate command from service template '${service.template}': ${error instanceof Error ? error.message : 'Unknown error'}`
+        );
+      }
     }
 
-    throw new Error(`Service '${service.name}' has no command or template defined`);
+    throw new Error(`Service '${service.name}' has no command or template specified`);
   }
 
   private async waitForServiceReady(service: Service, timeoutSeconds: number): Promise<void> {

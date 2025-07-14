@@ -3,7 +3,7 @@ import { ServiceTemplate, ServiceTemplateBase } from './ServiceTemplate';
 import { logger } from '../../utils/Logger';
 
 // Import all service templates
-import { PostgreSQLTemplate } from './templates/PostgreSQLTemplate';
+import { PostgreSQLTemplate } from './templates/POSTgreSQLTemplate';
 import { RedisTemplate } from './templates/RedisTemplate';
 import { MongoDBTemplate } from './templates/MongoDBTemplate';
 import { MySQLTemplate } from './templates/MySQLTemplate';
@@ -121,7 +121,7 @@ export class ServiceTemplateRegistry {
    */
   static validateTemplate(
     name: string,
-    config: Record<string, any>
+    config: Record<string, string | number | boolean | null | undefined>
   ): { valid: boolean; errors: string[] } {
     const template = this.getTemplate(name);
 
@@ -228,9 +228,9 @@ export class ServiceTemplateRegistry {
   }
 
   /**
-   * Get template suggestions based on project analysis
+   * Suggest templates based on project analysis
    */
-  static async suggestTemplates(projectPath: string): Promise<ServiceTemplate[]> {
+  static async suggestTemplates(_projectPath: string): Promise<ServiceTemplate[]> {
     return new Promise(async resolve => {
       try {
         // This would integrate with ProjectDetector to analyze the project

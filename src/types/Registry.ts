@@ -208,26 +208,35 @@ export const REGISTRY_PRESETS: Record<string, Omit<RegistryConfig, 'name'>> = {
 } as const;
 
 // Type guards
-export function isRegistryConfig(obj: any): obj is RegistryConfig {
+export function isRegistryConfig(obj: unknown): obj is RegistryConfig {
   return (
-    obj &&
+    obj !== null &&
+    obj !== undefined &&
     typeof obj === 'object' &&
-    typeof obj.name === 'string' &&
-    typeof obj.url === 'string' &&
-    typeof obj.type === 'string' &&
-    ['npm', 'pypi', 'crates', 'maven', 'nuget', 'hex', 'pub'].includes(obj.type)
+    'name' in obj &&
+    'url' in obj &&
+    'type' in obj &&
+    typeof (obj as Record<string, unknown>).name === 'string' &&
+    typeof (obj as Record<string, unknown>).url === 'string' &&
+    typeof (obj as Record<string, unknown>).type === 'string' &&
+    ['npm', 'pypi', 'crates', 'maven', 'nuget', 'hex', 'pub'].includes(
+      (obj as Record<string, unknown>).type as string
+    )
   );
 }
 
-export function isSearchOptions(obj: any): obj is SearchOptions {
+export function isSearchOptions(obj: unknown): obj is SearchOptions {
+  const record = obj as Record<string, unknown>;
   return (
-    obj &&
+    obj !== null &&
+    obj !== undefined &&
     typeof obj === 'object' &&
-    (obj.limit === undefined || typeof obj.limit === 'number') &&
-    (obj.offset === undefined || typeof obj.offset === 'number') &&
-    (obj.sortBy === undefined || ['relevance', 'downloads', 'updated'].includes(obj.sortBy)) &&
-    (obj.category === undefined || typeof obj.category === 'string') &&
-    (obj.keywords === undefined || Array.isArray(obj.keywords))
+    (record.limit === undefined || typeof record.limit === 'number') &&
+    (record.offset === undefined || typeof record.offset === 'number') &&
+    (record.sortBy === undefined ||
+      ['relevance', 'downloads', 'updated'].includes(record.sortBy as string)) &&
+    (record.category === undefined || typeof record.category === 'string') &&
+    (record.keywords === undefined || Array.isArray(record.keywords))
   );
 }
 
@@ -264,17 +273,17 @@ export function normalizePackageName(name: string, registryType: RegistryConfig[
   }
 }
 
-export function parseRegistryError(error: any): string {
-  if (typeof error === 'string') {
-    return error;
-  }
-
+export function parseRegistryError(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
 
-  if (error && typeof error === 'object') {
-    return error.message || error.error || JSON.stringify(error);
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  if (error && typeof error === 'object' && 'message' in error) {
+    return String((error as Record<string, unknown>).message);
   }
 
   return 'Unknown registry error';

@@ -69,7 +69,7 @@ export class FileSystem {
     return false;
   }
 
-  static async readJsonFile<T = any>(filePath: string): Promise<T | null> {
+  static async readJsonFile<T = unknown>(filePath: string): Promise<T | null> {
     try {
       if (!(await fs.pathExists(filePath))) {
         return null;
@@ -84,7 +84,7 @@ export class FileSystem {
     }
   }
 
-  static async writeJsonFile(filePath: string, data: any): Promise<void> {
+  static async writeJsonFile(filePath: string, data: unknown): Promise<void> {
     try {
       await fs.ensureDir(path.dirname(filePath));
       await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');

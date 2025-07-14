@@ -8,6 +8,7 @@ export interface ProcessOptions {
   shell?: boolean;
   detached?: boolean;
   stdio?: 'inherit' | 'pipe' | 'ignore';
+  timeout?: number; // Add timeout property
 }
 
 export interface ProcessResult {

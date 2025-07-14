@@ -7,8 +7,22 @@ import { PackageManager, type AddPackageOptions } from '../core/PackageManager';
 import { RuntimeRegistry } from '../core/runtime/RuntimeRegistry';
 import { ServiceTemplateRegistry } from '../core/service/ServiceTemplateRegistry';
 import { logger } from '../utils/Logger';
-import { PackageType } from '../types/Package';
+import { PackageType, PackageInstallResult } from '../types/Package';
 import { RuntimeType } from '../types/Runtime';
+import path from 'path';
+
+interface AddCommandFlags {
+  dev: boolean;
+  global: boolean;
+  optional: boolean;
+  config: string[] | undefined;
+  force: boolean;
+  runtime: string | undefined;
+  manager: string | undefined;
+  'dry-run': boolean;
+  'skip-if-exists': boolean;
+  type: string | undefined;
+}
 
 export default class Add extends Command {
   static override description = 'Add packages, runtimes, or services to the current project';
@@ -110,32 +124,27 @@ export default class Add extends Command {
       }
 
       const packageManager = new PackageManager({
-        projectPath: currentProject.path,
-        cacheDir: configManager.getConfigDir(),
-        force: flags.force,
+        projectPath: process.cwd(),
+        cacheDir: path.join(process.cwd(), '.switchr', 'cache'),
       });
 
       // Build options object conditionally to satisfy exactOptionalPropertyTypes
-      const addOptions: AddPackageOptions = {
+      const options: AddPackageOptions = {
         dev: flags.dev,
         global: flags.global,
         optional: flags.optional,
+        force: flags.force,
         skipIfExists: flags['skip-if-exists'],
+        ...(flags.runtime && { runtime: flags.runtime }),
+        ...(flags.manager && { manager: flags.manager }),
       };
 
-      // Only add optional properties if they have values
-      if (flags.runtime) {
-        addOptions.runtime = flags.runtime;
-      }
-      if (flags.manager) {
-        addOptions.manager = flags.manager;
-      }
+      const packageSpec = args.package;
 
-      // Add the package
-      const result = await packageManager.addPackage(args.package, addOptions);
+      const result = await packageManager.addPackage(packageSpec, options);
 
       if (result.success) {
-        this.log(chalk.green(`✅ Successfully added ${args.package}`));
+        this.log(chalk.green(`✅ Successfully added ${packageSpec}`));
 
         if (result.warnings && result.warnings.length > 0) {
           result.warnings.forEach(warning => {
@@ -149,7 +158,7 @@ export default class Add extends Command {
         // Show next steps
         this.showNextSteps(result.package.name, result.package.type);
       } else {
-        this.error(`Failed to add ${args.package}: ${result.error}`);
+        this.error(result.error || 'Failed to add package');
       }
     } catch (error) {
       logger.error('Failed to add package', error);
@@ -170,7 +179,7 @@ export default class Add extends Command {
     }
   }
 
-  private async showDryRun(packageSpec: string, flags: any): Promise<void> {
+  private async showDryRun(packageSpec: string, flags: AddCommandFlags): Promise<void> {
     this.log(chalk.yellow('🧪 Dry run - showing what would be added:\n'));
 
     const [name, packageVersion] = packageSpec.split('@');
@@ -178,29 +187,30 @@ export default class Add extends Command {
 
     this.log(chalk.blue(`📦 Package: ${chalk.white(name)}`));
     this.log(chalk.gray(`   Type: ${packageType}`));
-    if (packageVersion) this.log(chalk.gray(`   Version: ${packageVersion}`));
-    if (flags.dev) this.log(chalk.gray(`   Development dependency: Yes`));
-    if (flags.global) this.log(chalk.gray(`   Global installation: Yes`));
-    if (flags.runtime) this.log(chalk.gray(`   Runtime: ${flags.runtime}`));
-    if (flags.manager) this.log(chalk.gray(`   Version Manager: ${flags.manager}`));
 
-    if (packageType === 'service' && flags.config?.length > 0) {
-      this.log(chalk.gray(`   Configuration:`));
-      const config = this.parseServiceConfig(flags.config);
-      Object.entries(config).forEach(([key, value]) => {
-        this.log(chalk.gray(`     ${key}: ${value}`));
-      });
+    if (packageVersion) {
+      this.log(chalk.gray(`   Version: ${packageVersion}`));
     }
 
-    if (packageType === 'runtime') {
-      await this.showRuntimeDryRun(name, packageVersion);
-    } else if (packageType === 'service') {
-      await this.showServiceDryRun(name);
-    } else if (packageType === 'dependency') {
-      await this.showDependencyDryRun(name, flags, packageVersion);
+    if (flags.config && flags.config.length > 0) {
+      this.log(chalk.gray(`   Config: ${flags.config.join(', ')}`));
     }
 
-    this.log(chalk.yellow('\n💡 Run without --dry-run to add the package'));
+    switch (packageType) {
+      case 'runtime':
+        await this.showRuntimeDryRun(name, packageVersion);
+        break;
+      case 'service':
+        await this.showServiceDryRun(name);
+        break;
+      case 'dependency':
+        await this.showDependencyDryRun(name, flags, packageVersion);
+        break;
+      default:
+        this.log(chalk.gray(`   Installation: Standard package installation`));
+    }
+
+    this.log(chalk.yellow('\n💡 Run without --dry-run to execute the installation'));
   }
 
   private async showRuntimeDryRun(name: string, packageVersion?: string): Promise<void> {
@@ -293,8 +303,8 @@ export default class Add extends Command {
   }
 
   private async showDependencyDryRun(
-    name: string,
-    flags: any,
+    _name: string,
+    flags: AddCommandFlags,
     packageVersion?: string
   ): Promise<void> {
     const runtime = flags.runtime || (await this.detectProjectRuntime());
@@ -320,7 +330,7 @@ export default class Add extends Command {
     }
   }
 
-  private async showAddedPackage(result: any): Promise<void> {
+  private async showAddedPackage(result: PackageInstallResult): Promise<void> {
     const { package: pkg, installedVersion, installPath } = result;
 
     this.log(chalk.blue('\n📋 Package Details:'));
@@ -373,7 +383,7 @@ export default class Add extends Command {
     this.log(chalk.gray(`   Use 'switchr start' to run services`));
   }
 
-  private async detectPackageType(name: string, flags: any): Promise<PackageType> {
+  private async detectPackageType(name: string, flags: AddCommandFlags): Promise<PackageType> {
     // Explicit type from flags
     if (flags.type) return flags.type as PackageType;
 
@@ -463,25 +473,6 @@ export default class Add extends Command {
     return 'npm'; // Default fallback
   }
 
-  private parseServiceConfig(configArray: string[]): Record<string, any> {
-    const config: Record<string, any> = {};
-
-    for (const configStr of configArray) {
-      const [key, value] = configStr.split('=', 2);
-      if (key && value !== undefined) {
-        // Try to parse as number or boolean
-        let parsedValue: any = value;
-        if (value === 'true') parsedValue = true;
-        else if (value === 'false') parsedValue = false;
-        else if (!isNaN(Number(value)) && value.trim() !== '') parsedValue = Number(value);
-
-        config[key] = parsedValue;
-      }
-    }
-
-    return config;
-  }
-
   private showNextSteps(packageName: string, packageType: PackageType): void {
     this.log(chalk.blue('\n🎯 Next steps:'));
 
@@ -510,5 +501,14 @@ export default class Add extends Command {
 
     this.log(chalk.gray(`   • View all packages: ${chalk.white('switchr packages')}`));
     this.log(chalk.gray(`   • Switch projects: ${chalk.white('switchr switch <project>')}`));
+  }
+
+  // TODO: Will be needed for advanced service configuration parsing
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  // @ts-expect-error - Method reserved for future use
+  private _parseServiceConfig(_configString: string): Record<string, unknown> {
+    // This method will be used to parse complex service configuration
+    // from command line arguments in a future update
+    return {};
   }
 }

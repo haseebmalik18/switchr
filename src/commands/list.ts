@@ -2,7 +2,13 @@ import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import { ConfigManager } from '../core/ConfigManager';
 import { logger } from '../utils/Logger';
-import { Service } from '../types/Project';
+import { Service, ProjectProfile } from '../types/Project';
+import { GlobalConfig } from '../types/Config';
+
+interface ProjectListItem {
+  info: GlobalConfig['projects'][string];
+  profile: ProjectProfile;
+}
 
 export default class List extends Command {
   static override description = 'List all switchr projects';
@@ -20,11 +26,8 @@ export default class List extends Command {
       default: false,
     }),
     json: Flags.boolean({
+      char: 'j',
       description: 'Output in JSON format',
-      default: false,
-    }),
-    favorites: Flags.boolean({
-      description: 'Show only favorite projects',
       default: false,
     }),
   };
@@ -37,28 +40,26 @@ export default class List extends Command {
       const projects = await configManager.getAllProjects();
 
       if (projects.length === 0) {
-        this.log(chalk.yellow('📋 No projects found.'));
+        this.log(chalk.yellow('📭 No projects found.'));
         this.log(chalk.gray(`   Run ${chalk.white('switchr init')} to create your first project.`));
         return;
       }
 
-      // Filter favorites if requested
-      const filteredProjects = flags.favorites
-        ? projects.filter(({ info }) => info.favorite)
-        : projects;
-
-      if (filteredProjects.length === 0 && flags.favorites) {
-        this.log(chalk.yellow('⭐ No favorite projects found.'));
-        return;
-      }
+      // Sort projects by last used date (most recent first)
+      const sortedProjects = projects.sort((a, b) => {
+        const aDate = new Date(a.info.lastUsed || '1970-01-01');
+        const bDate = new Date(b.info.lastUsed || '1970-01-01');
+        return bDate.getTime() - aDate.getTime();
+      });
 
       // Get current project
       const currentProject = await configManager.getCurrentProject();
+      const currentProjectName = currentProject?.name;
 
       if (flags.json) {
-        this.outputJson(filteredProjects);
+        this.outputJson(sortedProjects);
       } else {
-        this.outputTable(filteredProjects, currentProject?.name, flags.verbose);
+        this.outputTable(sortedProjects, currentProjectName, flags.verbose);
       }
     } catch (error) {
       logger.error('Failed to list projects', error);
@@ -66,7 +67,7 @@ export default class List extends Command {
     }
   }
 
-  private outputJson(projects: any[]): void {
+  private outputJson(projects: ProjectListItem[]): void {
     const output = projects.map(({ info, profile }) => ({
       name: profile.name,
       type: profile.type,
@@ -82,7 +83,7 @@ export default class List extends Command {
   }
 
   private outputTable(
-    projects: any[],
+    projects: ProjectListItem[],
     currentProjectName?: string,
     verbose: boolean = false
   ): void {
